@@ -87,3 +87,60 @@ export async function picwishCutout(env, dataUrl, opts = {}) {
     return { ok: false, error: { code: 'picwish_exception', message: String(e && e.message || e) } };
   }
 }
+
+/**
+ * M2.3：用公网图片 URL 调用 PicWish 抠图（Worker 不再中转原图字节）。
+ * @param {object} env Worker env
+ * @param {string} imageUrl 公网可访问的图片 URL（如 TOS 预签名 GET）
+ * @param {object} [opts] { type?: 'object'|'person'|'stamp' }
+ * @returns {Promise<{ok:true,image:string,width:number,height:number,ms:number}|
+ *                    {ok:false,error:{code,message?}}>}
+ *   image 为 data:image/png;base64,...（调用方应立即转存 TOS 并释放该字符串）。
+ */
+export async function picwishCutoutByUrl(env, imageUrl, opts = {}) {
+  const t0 = Date.now();
+  const key = env.PICWISH_API_KEY;
+  if (!key) {
+    return { ok: false, error: { code: 'picwish_not_configured', message: 'PICWISH_API_KEY 未配置' } };
+  }
+  if (typeof imageUrl !== 'string' || !/^https?:\/\//.test(imageUrl)) {
+    return { ok: false, error: { code: 'bad_image_url', message: 'imageUrl 必须是 http(s) 公网 URL' } };
+  }
+  try {
+    const fd = new FormData();
+    fd.append('sync', '1');
+    fd.append('type', opts.type || 'object');
+    fd.append('return_type', '2');   // base64
+    fd.append('format', 'png');       // transparent
+    fd.append('output_type', '2');   // image only
+    fd.append('image_url', imageUrl);
+    const r = await fetch(BASE + '/api/tasks/visual/segmentation', {
+      method: 'POST',
+      headers: { 'X-API-KEY': key },
+      body: fd,
+      signal: AbortSignal.timeout(120000),
+    });
+    const txt = await r.text();
+    if (r.status !== 200) {
+      return { ok: false, error: { code: 'picwish_http_' + r.status, message: txt.slice(0, 300) } };
+    }
+    let j;
+    try { j = JSON.parse(txt); }
+    catch { return { ok: false, error: { code: 'picwish_bad_json', message: txt.slice(0, 200) } }; }
+    if (j.status !== 200 || !j.data || j.data.state !== 1) {
+      return { ok: false, error: { code: 'picwish_task_failed', message: 'state=' + (j.data && j.data.state) + ' msg=' + (j.message || '').slice(0, 200) } };
+    }
+    const b64 = j.data.image;
+    if (!b64) return { ok: false, error: { code: 'picwish_no_image', message: txt.slice(0, 200) } };
+    const out = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const size = pngSize(out);
+    return {
+      ok: true,
+      image: bytesToPngDataUrl(out),
+      width: size.width, height: size.height,
+      ms: Date.now() - t0,
+    };
+  } catch (e) {
+    return { ok: false, error: { code: 'picwish_exception', message: String(e && e.message || e) } };
+  }
+}

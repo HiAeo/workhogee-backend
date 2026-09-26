@@ -1,4 +1,4 @@
-/* =====================================================================
+﻿/* =====================================================================
  * WorkHogee 生图伙计 · Cloudflare Worker 薄代理层
  * ---------------------------------------------------------------------
  * 职责（刻意保持“薄”）：
@@ -33,6 +33,7 @@ import { mediakitCutout, mediakitFaceDetect } from './mediakit.js';
 import { giteeMatting } from './gitee.js';
 import { autodlCutout, autodlSuperRes } from './autodl.js';
 import { picwishCutout } from './picwish.js';
+import { createUploadUrl, createAndRunJob, getJob, tryAcquireSlot, releaseSlot, headObject, keyBelongsTo } from './m23-job.js';
 
 const ARK_ENDPOINT_DEFAULT = 'https://ark.cn-beijing.volces.com/api/v3/images/generations';
 // 火山图像接口要求输出像素 ≥ 3,686,400。
@@ -103,27 +104,31 @@ const DATA_URL_RE = /^data:image\/(jpe?g|png|webp);base64,([A-Za-z0-9+/=\s]+)$/;
 
 // 调用一次火山 Seedream 图生图；成功返回 { b64 }，失败返回 { error, status }
 // timeoutMs 同时约束"建连 + 响应头 + 响应体读取"，避免上游连接/响应体挂起导致请求永不返回
-async function callSeedream(env, { prompt, imagePayload, size, timeoutMs = 110000 }) {
+async function callSeedream(env, { prompt, imagePayload, size, timeoutMs = 110000, responseFormat } = {}) {
   if (!env.ARK_API_KEY) {
     return { status: 500, error: { code: 'server_misconfigured', message: '图像服务密钥未配置' } };
   }
+  // M2.3：文生图（不传 image）默认用 url 输出，Worker 完全不碰图片字节；
+  // 图生图老调用方仍默认 b64_json。
+  const wantUrl = responseFormat === 'url' || (!imagePayload && responseFormat === undefined);
   const ctrl = new AbortController();
   const timer = setTimeout(() => { try { ctrl.abort(); } catch {} }, timeoutMs);
   let upstream, text;
   try {
+    const body = {
+      model: env.ARK_MODEL,
+      prompt,
+      size,
+      response_format: wantUrl ? 'url' : 'b64_json'
+    };
+    if (imagePayload) body.image = imagePayload;
     upstream = await fetch(env.ARK_ENDPOINT || ARK_ENDPOINT_DEFAULT, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + env.ARK_API_KEY
       },
-      body: JSON.stringify({
-        model: env.ARK_MODEL,
-        prompt,
-        image: imagePayload,
-        size,
-        response_format: 'b64_json'
-      }),
+      body: JSON.stringify(body),
       signal: ctrl.signal
     });
     text = await upstream.text(); // abort 信号同样能中断挂起的响应体读取
@@ -147,7 +152,12 @@ async function callSeedream(env, { prompt, imagePayload, size, timeoutMs = 11000
   try { parsed = JSON.parse(text); }
   catch { return { status: 502, error: { code: 'upstream_bad_json', message: '图像模型返回解析失败' } }; }
 
-  const b64 = parsed && parsed.data && parsed.data[0] && parsed.data[0].b64_json;
+  const first = parsed && parsed.data && parsed.data[0] || {};
+  if (wantUrl) {
+    if (!first.url) return { status: 502, error: { code: 'no_image_url', message: '图像模型未返回图片 URL' } };
+    return { url: first.url };
+  }
+  const b64 = first.b64_json;
   if (!b64) return { status: 502, error: { code: 'no_image', message: '图像模型未返回图片数据' } };
   return { b64 };
 }
@@ -741,14 +751,14 @@ async function pipelineTextGenWithRetry(env, opts, retries = 1) {
 }
 // 文生图（不传 imagePayload）→ dataURL；失败抛错由上层 .catch 兜底为 null
 async function pipelineTextGen(env, { prompt, size, timeoutMs }) {
-  const r = await callSeedream(env, { prompt, size, timeoutMs });
+  const r = await callSeedream(env, { prompt, size, timeoutMs, responseFormat: 'b64_json' });
   if (r.error) throw new Error((r.error && r.error.code) || 'seedream_failed');
   const stamped = stampImageMeta(r.b64);
   const mime = stamped.mime && stamped.mime !== 'image/unknown' ? stamped.mime : 'image/jpeg';
   return 'data:' + mime + ';base64,' + stamped.b64;
 }
 
-async function handlePipeline(req, env, origin, ctx) {
+async function handlePipeline(req, env, origin, ctx, preBody) {
   // 会员门禁（与 M1 一致）
   const session = await getMemberSession(env, req);
   if (!session) {
@@ -769,9 +779,11 @@ async function handlePipeline(req, env, origin, ctx) {
     return json({ ok: false, error: { code: 'quota_check_failed', message: '额度校验异常，请重试' } }, 500, origin);
   }
 
-  let body;
-  try { body = await req.json(); }
-  catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
+  let body = preBody;
+  if (!body) {
+    try { body = await req.json(); }
+    catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
+  }
 
   const image = body && body.image;
   if (typeof image !== 'string' || !DATA_URL_RE.test(image)) {
@@ -1082,6 +1094,87 @@ async function handlePipeline(req, env, origin, ctx) {
     exportSpecs: EXPORT_SPECS_M2,
     videoReady: false
   }, 200, origin);
+}
+
+async function handleUploadUrl(req, env, origin) {
+  const session = await getMemberSession(env, req);
+  if (!session) return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号' } }, 401, origin);
+  if (session.status === 'suspended') return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用' } }, 403, origin);
+  let body = {};
+  try { body = await req.json(); } catch {}
+  try {
+    const r = await createUploadUrl(env, session);
+    return json({ ok: true, uploadUrl: r.uploadUrl, key: r.key, expiresSec: r.expiresSec, contentType: 'image/jpeg' }, 200, origin);
+  } catch (e) {
+    const code = (e && e.code) || 'upload_url_failed';
+    const status = code === 'storage_unavailable' ? 503 : 500;
+    return json({ ok: false, error: { code, message: String((e && e.message) || e) } }, status, origin);
+  }
+}
+
+// M2.3 异步 pipeline：只收 TOS key，立刻返回 jobId，后台跑。
+async function handlePipelineAsync(req, env, origin, ctx, body) {
+  const session = await getMemberSession(env, req);
+  if (!session) return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号后再生成物料包' } }, 401, origin);
+  if (session.status === 'suspended') return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用' } }, 403, origin);
+
+  const key = String((body && body.key) || '');
+  const category = String((body && body.category) || '').slice(0, 50);
+  const style = String((body && body.style) || '').slice(0, 100);
+
+  // 1) key 归属校验（无网络）
+  if (!keyBelongsTo(session, key)) {
+    return json({ ok: false, error: { code: 'forbidden_key', message: 'key 不合法或不属于当前会员' } }, 400, origin);
+  }
+  // 2) HEAD TOS 对象存在
+  const exists = await headObject(env, key);
+  if (!exists) {
+    return json({ ok: false, error: { code: 'object_not_found', message: '上传对象不存在，请先调 /upload-url 并 PUT 上传' } }, 400, origin);
+  }
+  // 3) 并发槽位（先占位，避免满员还扣额度）
+  if (!(await tryAcquireSlot(env, session.id))) {
+    return json({ ok: false, error: { code: 'queue_full', message: '排队中，请稍候（每用户最多 2 个并行任务）' } }, 429, origin);
+  }
+  // 4) 额度
+  let quotaResult = null;
+  try {
+    quotaResult = await checkAndDeductQuota(env, session.id, 1);
+    if (!quotaResult.ok) {
+      await releaseSlot(env, session.id);
+      return json({ ok: false, error: { code: 'quota_exhausted', message: quotaResult.message || '额度不足' } }, 402, origin);
+    }
+  } catch (e) {
+    await releaseSlot(env, session.id);
+    return json({ ok: false, error: { code: 'quota_check_failed', message: '额度校验异常，请重试' } }, 500, origin);
+  }
+  // 5) 创建并后台执行（失败时内部会释放槽位）
+  try {
+    const r = await createAndRunJob(env, session, { key, category, style, quotaResult });
+    return json({ ok: true, jobId: r.jobId, status: r.status }, 202, origin);
+  } catch (e) {
+    await releaseSlot(env, session.id);
+    return json({ ok: false, error: { code: 'start_failed', message: String((e && e.message) || e) } }, 500, origin);
+  }
+}
+
+// M2.3 旧 /pipeline（base64 同步）兼容分发：body 里有 key 走异步，否则走旧同步。
+async function handlePipelineDispatch(req, env, origin, ctx) {
+  let body;
+  try { body = await req.json(); }
+  catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
+  if (body && typeof body.key === 'string' && body.key) {
+    return await handlePipelineAsync(req, env, origin, ctx, body);
+  }
+  return await handlePipeline(req, env, origin, ctx, body);
+}
+
+async function handleJobStatus(req, env, origin, url) {
+  const session = await getMemberSession(env, req);
+  if (!session) return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号' } }, 401, origin);
+  const jobId = url.searchParams.get('id') || '';
+  const r = await getJob(env, session, jobId);
+  if (!r.ok) return json({ ok: false, error: { code: r.error.code, message: r.error.message } }, r.status, origin);
+  return json({ ok: true, ...r.job }, 200, origin);
 }
 
 async function handlePrivacyDetect(req, env, origin) {
@@ -1440,10 +1533,20 @@ export default {
       return handleVerify(request, env, origin);
     }
 
-    // M1 端到端物料包 pipeline：品类识别→抠图→8图+文案一键生成（会员门禁）
+    // M2.3：原图直传 TOS 预签名（浏览器 PUT 直传，Worker 不中转字节）
+    if (path === '/upload-url' && request.method === 'POST') {
+      return handleUploadUrl(request, env, origin);
+    }
+
+    // M2.3 异步 job 状态轮询（只返回 JSON + URL，不返回图片数据）
+    if (path === '/job' && request.method === 'GET') {
+      return handleJobStatus(request, env, origin, url);
+    }
+
+    // M2.3 物料包 pipeline（分发：带 key 走异步 job；带 base64 走旧同步兼容，已 deprecated）
     if (path === '/pipeline' && request.method === 'POST') {
       try {
-        return await handlePipeline(request, env, origin, ctx);
+        return await handlePipelineDispatch(request, env, origin, ctx);
       } catch (e) {
         return json({ ok: false, error: { code: 'pipeline_crash', message: String((e && e.message) || e) } }, 500, origin);
       }

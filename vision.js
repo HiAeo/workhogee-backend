@@ -1,4 +1,4 @@
-﻿/* =====================================================================
+/* =====================================================================
  * WorkHogee · 火山方舟多模态视觉理解（豆包 Seed 2.1 turbo，原生多模态）服务端模块
  * ---------------------------------------------------------------------
  * 仅在 Worker 服务端调用，ARK_API_KEY 永不落地浏览器。用于两件事：
@@ -99,6 +99,9 @@ function clamp01(n) {
   return Math.min(1, Math.max(0, v));
 }
 
+// M2.3: image input accepts both data: base64 and public https URLs (e.g. TOS presigned GET).
+const VISION_IMG_RE = /^(data:image\/(?:jpe?g|png|webp);base64,|https?:\/\/)/;
+
 function normBoxes(arr) {
   if (!Array.isArray(arr)) return [];
   return arr
@@ -122,7 +125,7 @@ export async function chatVisionJson(env, images, timeoutMs = 45000) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { ok: false, error: 'no_api_key' };
   const validImages = (images || []).filter(
-    u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u)
+    u => typeof u === 'string' && VISION_IMG_RE.test(u)
   );
   if (validImages.length < 1) return { ok: false, error: 'no_image' };
 
@@ -173,7 +176,7 @@ export async function chatVisionJson(env, images, timeoutMs = 45000) {
 export async function chatVisionCustom(env, { system = '', user = '', images = [], maxTokens = 1400, temperature = 0.2, timeoutMs = 45000 }) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { ok: false, error: 'no_api_key' };
-  const validImages = (images || []).filter(u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u));
+  const validImages = (images || []).filter(u => typeof u === 'string' && VISION_IMG_RE.test(u));
   const content = validImages.map(u => ({ type: 'image_url', image_url: { url: u, detail: 'auto' } }));
   content.push({ type: 'text', text: user });
   let resp;
@@ -400,7 +403,7 @@ const QC_SYSTEM_PROMPT = [
 export async function qcUpload(env, imageDataUrl) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { available: false, level: 'ok' };
-  if (typeof imageDataUrl !== 'string' || !/^data:image\/(jpe?g|png|webp);base64,/.test(imageDataUrl)) {
+  if (typeof imageDataUrl !== 'string' || !VISION_IMG_RE.test(imageDataUrl)) {
     return { available: false, level: 'ok' };
   }
   let resp;
@@ -466,7 +469,7 @@ const IDENTIFY_SYSTEM_PROMPT = [
 export async function identifyProduct(env, imageDataUrl) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { available: false, fields: {} };
-  if (typeof imageDataUrl !== 'string' || !/^data:image\/(jpe?g|png|webp);base64,/.test(imageDataUrl)) {
+  if (typeof imageDataUrl !== 'string' || !VISION_IMG_RE.test(imageDataUrl)) {
     return { available: false, fields: {} };
   }
   let resp;
@@ -531,7 +534,7 @@ export async function groupProducts(env, images, timeoutMs = 45000) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { ok: false, error: 'no_api_key' };
   const validImages = (images || []).filter(
-    u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u)
+    u => typeof u === 'string' && VISION_IMG_RE.test(u)
   );
   if (validImages.length < 1) return { ok: false, error: 'no_image' };
 
@@ -617,7 +620,7 @@ export async function extractProductFeatures(env, images, opts = {}) {
   const visionKey = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !visionKey) return { ok: false, error: 'no_api_key' };
   const validImages = (images || []).filter(
-    u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u)
+    u => typeof u === 'string' && VISION_IMG_RE.test(u)
   ).slice(0, 6);
   if (validImages.length < 2) return { ok: false, error: 'no_image' };
 
@@ -744,7 +747,7 @@ export async function prefillFacts(env, { image = '', identityType = 'general', 
   ].filter(Boolean).join('\n');
 
   const content = [];
-  if (image && /^data:image\/(jpe?g|png|webp);base64,/.test(image)) {
+  if (image && VISION_IMG_RE.test(image)) {
     content.push({ type: 'text', text: userText });
     content.push({ type: 'image_url', image_url: { url: image } });
   } else {
@@ -1321,19 +1324,36 @@ export async function generatePipelineCopy(env, attrs = {}) {
 export async function checkCutoutQuality(env, { original, cutout } = {}) {
   const key = env && (env.VISION_API_KEY || env.ARK_API_KEY);
   if (!env || !key) return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: ['no_vision_key'] };
-  const images = [original, cutout].filter(u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u));
-  if (images.length < 2) {
+  // M2.3: 支持单图（仅 cutout，公网 URL）质检；老调用方传 {original, cutout} 双图对比仍兼容。
+  const twoImage = typeof original === 'string' && VISION_IMG_RE.test(original) && typeof cutout === 'string' && VISION_IMG_RE.test(cutout);
+  const oneImage = !twoImage && typeof cutout === 'string' && VISION_IMG_RE.test(cutout);
+  if (!twoImage && !oneImage) {
     return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: ['no_cutout_image'] };
   }
-  const sys = '你是电商抠图质检员。第一张是用户原始商品图，第二张是AI抠出的商品透明PNG（请把它想象为贴在白底上观察）。只输出JSON，不要解释。';
-  const user = [
-    '请按以下标准打分（0~1 的小数）：',
-    'consistency：第二张里的商品与第一张是否为同一结构——有无缺块、漏抠、多余物体、变形。完全一致=1.0，明显缺角漏块=0.5以下。',
-    'textReadability：商品包装/瓶身/标签上的文字在第二张里是否依然清晰可读。完全清晰=1.0，糊成一团/被抠掉=0.3以下。图中本就无文字则给1.0。',
-    'edgeCleanliness：第二张商品边缘是否干净——有无白边光晕、背景残留色块、内部空洞。非常干净=1.0，有明显残影=0.5以下。',
-    'issues：发现的具体问题（中文短句），没有就给空数组。',
-    '只输出JSON：{"consistency":0.95,"textReadability":0.9,"edgeCleanliness":0.92,"issues":["..."]}'
-  ].join('\n');
+  const images = twoImage ? [original, cutout] : [cutout];
+  let sys, user;
+  if (twoImage) {
+    sys = '你是电商抠图质检员。第一张是用户原始商品图，第二张是AI抠出的商品透明PNG（请把它想象为贴在白底上观察）。只输出JSON，不要解释。';
+    user = [
+      '请按以下标准打分（0~1 的小数）：',
+      'consistency：第二张里的商品与第一张是否为同一结构——有无缺块、漏抠、多余物体、变形。完全一致=1.0，明显缺角漏块=0.5以下。',
+      'textReadability：商品包装/瓶身/标签上的文字在第二张里是否依然清晰可读。完全清晰=1.0，糊成一团/被抠掉=0.3以下。图中本就无文字则给1.0。',
+      'edgeCleanliness：第二张商品边缘是否干净——有无白边光晕、背景残留色块、内部空洞。非常干净=1.0，有明显残影=0.5以下。',
+      'issues：发现的具体问题（中文短句），没有就给空数组。',
+      '只输出JSON：{"consistency":0.95,"textReadability":0.9,"edgeCleanliness":0.92,"issues":["..."]}'
+    ].join('\n');
+  } else {
+    // M2.3 单图模式：只看抠图边缘干净度 / 包装文字可读 / 主体完整，不做双图对比。
+    sys = '你是电商抠图质检员。给你一张AI抠出的商品透明PNG（请把它想象为贴在白底上观察）。只输出JSON，不要解释。';
+    user = [
+      '请按以下标准打分（0~1 的小数）：',
+      'consistency：商品主体结构是否完整——有无缺块、漏抠、多余物体、变形、断肢。完整=1.0，明显缺角漏块=0.5以下。',
+      'textReadability：商品包装/瓶身/标签上的文字是否依然清晰可读。完全清晰=1.0，糊成一团/被抠掉=0.3以下。图中本就无文字则给1.0。',
+      'edgeCleanliness：商品边缘是否干净——有无白边光晕、背景残留色块、内部空洞、锯齿。非常干净=1.0，有明显残影=0.5以下。',
+      'issues：发现的具体问题（中文短句），没有就给空数组。',
+      '只输出JSON：{"consistency":0.95,"textReadability":0.9,"edgeCleanliness":0.92,"issues":["..."]}'
+    ].join('\n');
+  }
   const r = await chatVisionCustom(env, { system: sys, user, images, maxTokens: 500, temperature: 0.1, timeoutMs: 15000 });
   if (!r.ok) {
     return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: [String(r.error || 'qc_failed')] };

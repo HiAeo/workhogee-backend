@@ -156,3 +156,51 @@ export function presignPut(o) {
 export function presignGet(o) {
   return presign({ ...o, method: 'GET' });
 }
+
+/* =====================================================================
+ * M2.3 薄 Worker 封装：服务端用 IAM 凭证经预签名 URL 直接读写 TOS。
+ * 这些函数只在 Worker 内部用，外部拿到的永远是 object key 或预签名 URL。
+ * ===================================================================*/
+
+/**
+ * 服务端把 buffer 上传到指定 key。
+ * 实现：生成短时 PUT 预签名，再 fetch PUT 过去（不在 Worker 内长期持有签名/字节）。
+ * @param {object} cfg tosConfig(env) 的产物
+ * @param {string} key 对象 key
+ * @param {ArrayBuffer|Uint8Array|Buffer} bytes
+ * @param {string} contentType 如 image/png
+ */
+export async function tosPut(cfg, key, bytes, contentType = 'image/jpeg') {
+  if (!cfg || !cfg.accessKeyId || !cfg.secretAccessKey || !cfg.bucket) {
+    throw new Error('tos_put: TOS 未配置');
+  }
+  const put = await presignPut({ ...cfg, key, expiresSec: 600 });
+  const r = await fetch(put.url, {
+    method: 'PUT',
+    headers: { 'Content-Type': contentType },
+    body: bytes
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error('tos_put_http_' + r.status + ' ' + t.slice(0, 200));
+  }
+  return { key, version: r.headers.get('x-tos-version-id') || null };
+}
+
+/** 生成一个有公网有效期的 GET 预签名 URL（供 PicWish / 视觉模型 / 浏览器读取）。 */
+export async function tosGetUrl(cfg, key, expiresSec = 3600) {
+  if (!cfg || !cfg.bucket) throw new Error('tos_get_url: TOS 未配置');
+  const g = await presignGet({ ...cfg, key, expiresSec });
+  return g.url;
+}
+
+/** HEAD 检查对象是否存在（可选，失败返回 false 不抛）。 */
+export async function tosHead(cfg, key) {
+  try {
+    const g = await presignGet({ ...cfg, key, expiresSec: 60 });
+    const r = await fetch(g.url, { method: 'HEAD' });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
