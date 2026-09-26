@@ -20,7 +20,7 @@ import { picwishCutoutByUrl } from './picwish.js';
 const DEFAULT_SIZE = '2048x2048';
 const ARK_ENDPOINT_DEFAULT = 'https://ark.cn-beijing.volces.com/api/v3/images/generations';
 // 同一 step 被视为「仍在被某次轮询执行」的窗口；超过则认为上次请求挂了，下次轮询重跑。
-const STEP_OWN_WINDOW_MS = 25000;
+const STEP_OWN_WINDOW_MS = 130000;
 
 const safeSeg = (s) => String(s == null ? '' : s).replace(/[^a-zA-Z0-9_-]/g, '');
 
@@ -114,6 +114,68 @@ async function seedreamTextGenUrl(env, { prompt, size, timeoutMs = 100000 }) {
     return url;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * 下载远程图片字节并转存到自有 TOS（解决 Seedream ark 公共 bucket 无 CORS 配置的问题）。
+ * 模式与 cutout 步骤一致：fetch → arrayBuffer → tosPut → 释放。逐张调用，单张内存。
+ * 失败返回 null（调用方保留原 Seedream URL 作为前端 <img> 降级直显）。
+ * @param {string} sourceUrl  远程图片 URL（Seedream 返回）
+ * @param {string} tosKey     自有 TOS 目标 key
+ * @returns {Promise<{key:string}|null>}
+ */
+async function reuploadImageToTos(env, sourceUrl, tosKey) {
+  const cfg = tosConfig(env);
+  // 最多尝试 2 次；每次下载加 30s 超时，避免 fetch 挂死拖垮整个 step
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch {} }, 30000);
+    try {
+      const r = await fetch(sourceUrl, { signal: ctrl.signal });
+      if (!r.ok) throw new Error('dl_http_' + r.status);
+      const ct = r.headers.get('content-type') || 'image/jpeg';
+      const bytes = await r.arrayBuffer();
+      await tosPut(cfg, tosKey, bytes, ct);
+      return { key: tosKey };
+    } catch (e) {
+      if (attempt === 1) return null; // 第二次仍失败：降级保留原 Seedream URL
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+/**
+ * 把已转存到自有 TOS 的 scene/marketing key 刷新为预签名 GET URL；
+ * 未转存成功的保留原 Seedream URL（前端会降级为 <img> 直显，不阻塞合成）。
+ * 在 getJob 返回前调用，保证 sceneUrls/marketingUrl 始终是最新可用 URL。
+ * 向后兼容：旧 job 没有 sceneSeedUrls 时原样保留 sceneUrls。
+ */
+async function refreshOutputUrls(env, job) {
+  if (!job || !job.results) return;
+  const cfg = tosConfig(env);
+  const seedUrls = job.results.sceneSeedUrls;
+  const keys = job.results.sceneKeys;
+  if (Array.isArray(seedUrls)) {
+    const out = [null, null, null];
+    for (let i = 0; i < 3; i++) {
+      const k = keys && keys[i];
+      if (k) {
+        try { out[i] = await tosGetUrl(cfg, k, 3600); }
+        catch { out[i] = seedUrls[i] || null; }
+      } else {
+        out[i] = seedUrls[i] || null;
+      }
+    }
+    job.results.sceneUrls = out;
+  }
+  if (job.results.marketingKey) {
+    try { job.results.marketingUrl = await tosGetUrl(cfg, job.results.marketingKey, 3600); } catch {}
+  }
+  if (!job.results.marketingUrl && job.results.marketingSeedUrl) {
+    job.results.marketingUrl = job.results.marketingSeedUrl;
   }
 }
 
@@ -235,31 +297,50 @@ async function stepScene(env, job) {
   const categoryName = (job.results.category && job.results.category.name) || '商品';
   const presets = pickBackgrounds(categoryName);
   const styleLine = job.style || '';
-  const sceneUrls = job.results.sceneUrls || [null, null, null];
+  // sceneSeedUrls = Seedream 原始 URL（生成状态 + 降级兜底）；sceneKeys = 自有 TOS key
+  const seedUrls = job.results.sceneSeedUrls || [null, null, null];
+  const sceneKeys = job.results.sceneKeys || [null, null, null];
+  const outPrefix = `outputs/${safeSeg(job.memberId)}/${safeSeg(job.jobId)}`;
   // 第一批：前两张并行（一次轮询请求内完成）
   const todo = [];
-  if (!sceneUrls[0]) todo.push(0);
-  if (!sceneUrls[1]) todo.push(1);
+  if (!seedUrls[0]) todo.push(0);
+  if (!seedUrls[1]) todo.push(1);
   await Promise.all(todo.map(i =>
     seedreamTextGenUrl(env, { prompt: sceneBgPrompt(presets[i].bg, styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 })
-      .then(u => { sceneUrls[i] = u; })
+      .then(u => { seedUrls[i] = u; })
       .catch(e => { job.errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); })
   ));
   // 第二批：第三张（留给下一次轮询）
-  if (!sceneUrls[2]) {
-    try { sceneUrls[2] = await seedreamTextGenUrl(env, { prompt: sceneBgPrompt(presets[2].bg, styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 }); }
+  if (!seedUrls[2]) {
+    try { seedUrls[2] = await seedreamTextGenUrl(env, { prompt: sceneBgPrompt(presets[2].bg, styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 }); }
     catch (e) { job.errors.push({ step: 'scene.2', message: String((e && e.message) || e) }); }
   }
-  job.results.sceneUrls = sceneUrls;
+  // 逐张转存到自有 TOS（下载→转存→释放，单张内存；失败降级保留 Seedream URL）
+  for (let i = 0; i < 3; i++) {
+    if (!seedUrls[i] || sceneKeys[i]) continue;
+    const up = await reuploadImageToTos(env, seedUrls[i], `${outPrefix}/scene_${i}.jpg`);
+    if (up) sceneKeys[i] = up.key;
+  }
+  job.results.sceneSeedUrls = seedUrls;
+  job.results.sceneKeys = sceneKeys;
   job.results.compositeGuide = { scene: presets.map(p => p.guide), marketing: { position: 'center', scale: 0.5, shadow: true } };
   // 全部三张拿到才算 done
-  if (!sceneUrls[0] || !sceneUrls[1] || !sceneUrls[2]) throw new Error('scene_partial_retry');
+  if (!seedUrls[0] || !seedUrls[1] || !seedUrls[2]) throw new Error('scene_partial_retry');
 }
 
 async function stepMarketing(env, job) {
   const styleLine = job.style || '';
-  const u = await seedreamTextGenUrl(env, { prompt: marketingBgPrompt(styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 });
-  job.results.marketingUrl = u;
+  let u = job.results.marketingSeedUrl;
+  if (!u) {
+    u = await seedreamTextGenUrl(env, { prompt: marketingBgPrompt(styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 });
+    job.results.marketingSeedUrl = u;
+  }
+  // 转存到自有 TOS（失败降级保留 Seedream URL；重试时不重复生成，省一次 Seedream 调用）
+  if (!job.results.marketingKey) {
+    const outPrefix = `outputs/${safeSeg(job.memberId)}/${safeSeg(job.jobId)}`;
+    const up = await reuploadImageToTos(env, u, `${outPrefix}/marketing.jpg`);
+    if (up) job.results.marketingKey = up.key;
+  }
 }
 
 async function stepCopy(env, job) {
@@ -322,11 +403,12 @@ export async function getJob(env, session, jobId) {
 
   const now = Date.now();
 
-  // 已结束：刷新 cutoutUrl 后返回
+  // 已结束：刷新 cutoutUrl / sceneUrls / marketingUrl 后返回
   if (job.status === 'done' || job.status === 'error') {
     if (job.results && job.results.cutoutKey) {
       try { job.results.cutoutUrl = await tosGetUrl(tosConfig(env), job.results.cutoutKey, 3600); } catch {}
     }
+    await refreshOutputUrls(env, job);
     return { ok: true, status: 200, job };
   }
 
@@ -374,10 +456,11 @@ export async function getJob(env, session, jobId) {
     await releaseSlot(env, session.id);
   }
 
-  // 刷新 cutoutUrl
+  // 刷新 cutoutUrl + sceneUrls/marketingUrl（自有 TOS 预签名）
   if (job.results && job.results.cutoutKey) {
     try { job.results.cutoutUrl = await tosGetUrl(tosConfig(env), job.results.cutoutKey, 3600); } catch {}
   }
+  await refreshOutputUrls(env, job);
   await saveJob(env, job);
   return { ok: true, status: 200, job };
 }
