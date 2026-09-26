@@ -1334,7 +1334,7 @@ export async function checkCutoutQuality(env, { original, cutout } = {}) {
     'issues：发现的具体问题（中文短句），没有就给空数组。',
     '只输出JSON：{"consistency":0.95,"textReadability":0.9,"edgeCleanliness":0.92,"issues":["..."]}'
   ].join('\n');
-  const r = await chatVisionCustom(env, { system: sys, user, images, maxTokens: 500, temperature: 0.1, timeoutMs: 30000 });
+  const r = await chatVisionCustom(env, { system: sys, user, images, maxTokens: 500, temperature: 0.1, timeoutMs: 15000 });
   if (!r.ok) {
     return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: [String(r.error || 'qc_failed')] };
   }

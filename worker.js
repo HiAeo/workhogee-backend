@@ -22,7 +22,6 @@ import { matchVehicle } from './kb-data.js';
 import { handleAdmin } from './admin.js';
 import { handleMember } from './member-api.js';
 import { getMemberSession, ensureBootstrapAdmin } from './member-auth.js';
-import { getMemberQuota, checkAndDeductQuota } from './members.js';
 import { handleFeed, ensureFeedBootstrap } from './feed.js';
 import { handleAnalytics, scheduledRollup } from './analytics.js';
 import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision, generatePipelineCopy, checkCutoutQuality } from './vision.js';
@@ -32,6 +31,7 @@ import { segmentEntities, superResolve, saliencySegment, goodsSegment, carPlateD
 import { mediakitCutout, mediakitFaceDetect } from './mediakit.js';
 import { giteeMatting } from './gitee.js';
 import { autodlCutout, autodlSuperRes } from './autodl.js';
+import { picwishCutout } from './picwish.js';
 
 const ARK_ENDPOINT_DEFAULT = 'https://ark.cn-beijing.volces.com/api/v3/images/generations';
 // 火山图像接口要求输出像素 ≥ 3,686,400。
@@ -570,6 +570,11 @@ async function handleCutout(req, env, origin) {
     if (!r.ok) return fail(r);
     return json({ ok: true, strategy: 'autodl', image: r.image, white: r.white, mask: r.mask, width: r.width, height: r.height, ms: r.ms }, 200, origin);
   }
+  if (strategy === 'picwish') {
+    const r = await picwishCutout(env, image);
+    if (!r.ok) return fail(r);
+    return json({ ok: true, strategy: 'picwish', image: r.image, width: r.width, height: r.height, ms: r.ms }, 200, origin);
+  }
   if (strategy === 'goods') {
     const gr = await goodsSegment(env, image, body.method || 'product');
     if (!gr.ok) return fail(gr);
@@ -708,19 +713,6 @@ async function handlePipeline(req, env, origin) {
     return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用，请联系客服' } }, 403, origin);
   }
 
-  // M2 额度门禁：totalAvailable = 月度剩余 + 加量包余额（含加量包，修复历史"加量包不生效"bug）
-  const quota = await getMemberQuota(env, session.id);
-  if (!quota || quota.totalAvailable <= 0) {
-    return json({
-      ok: false,
-      error: {
-        code: 'quota_exceeded',
-        message: '本月免费生成额度已用完，可购买加量包或升级套餐继续',
-        upgradeUrl: '/pricing'
-      }
-    }, 402, origin);
-  }
-
   let body;
   try { body = await req.json(); }
   catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
@@ -774,25 +766,32 @@ async function handlePipeline(req, env, origin) {
   }
   const categoryName = categoryInfo.name || '商品';
 
-  // 2) 抠图：autodl(BiRefNet) 优先，失败降级 gitee(RMBG-2.0)。
+  // 2) 抠图降级链：picwish(商用API) → autodl(BiRefNet) → gitee(RMBG-2.0)。
   //    M2 只返回透明 PNG 给前端合成，不再生成白底图。
   const tC = Date.now();
   let cutout = null;
   let cutoutStrategy = 'none';
   let cutoutPng = null;
   let cutoutMask = null;
-  const ac = await autodlCutout(env, image);
-  if (ac.ok) {
-    cutout = ac; cutoutStrategy = 'autodl';
-    cutoutPng = ac.image; cutoutMask = ac.mask || null;
+  const pw = await picwishCutout(env, image);
+  if (pw.ok) {
+    cutout = pw; cutoutStrategy = 'picwish';
+    cutoutPng = pw.image;
   } else {
-    errors.push({ step: 'cutout.autodl', message: (ac.error && ac.error.code) || 'autodl_failed' });
-    const gm = await giteeMatting(env, image);
-    if (gm.ok) {
-      cutout = gm; cutoutStrategy = 'gitee';
-      cutoutPng = gm.image;
+    errors.push({ step: 'cutout.picwish', message: (pw.error && pw.error.code) || 'picwish_failed' });
+    const ac = await autodlCutout(env, image);
+    if (ac.ok) {
+      cutout = ac; cutoutStrategy = 'autodl';
+      cutoutPng = ac.image; cutoutMask = ac.mask || null;
     } else {
-      errors.push({ step: 'cutout.gitee', message: (gm.error && gm.error.code) || 'gitee_failed' });
+      errors.push({ step: 'cutout.autodl', message: (ac.error && ac.error.code) || 'autodl_failed' });
+      const gm = await giteeMatting(env, image);
+      if (gm.ok) {
+        cutout = gm; cutoutStrategy = 'gitee';
+        cutoutPng = gm.image;
+      } else {
+        errors.push({ step: 'cutout.gitee', message: (gm.error && gm.error.code) || 'gitee_failed' });
+      }
     }
   }
   timing.cutout = Date.now() - tC;
@@ -861,32 +860,42 @@ async function handlePipeline(req, env, origin) {
   }
 
   // 6) 质检门禁（阿果）：抠图结构 / 包装文字可读性 / 边缘干净度评分，M2 不强制阻断
+  //    修复：超时/失败不再落 0 分且 passed=true；改为 available=false, passed=false, scores=null
+  //    并用 Promise.race 15s 硬超时，绝不阻塞主出图流程。
   const tQ = Date.now();
   const QC_THRESHOLD = { consistency: 0.92, textReadability: 0.9, edgeCleanliness: 0.9 };
   let qualityCheck = {
-    passed: true,
-    scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 },
+    passed: false,
+    available: false,
+    scores: null,
     thresholds: QC_THRESHOLD,
     issues: ['qc_unavailable']
   };
   try {
     if (cutoutPng) {
-      const q = await checkCutoutQuality(env, { original: image, cutout: cutoutPng });
+      // 质检与出图解耦：视觉模型最多等 15s，超时立即降级 qc_unavailable，不等模型返回
+      const qcPromise = checkCutoutQuality(env, { original: image, cutout: cutoutPng });
+      const qcTimeout = new Promise(resolve => setTimeout(() => resolve({
+        available: false, scores: null, issues: ['vision_timeout']
+      }), 15000));
+      const q = await Promise.race([qcPromise, qcTimeout]);
       timing.quality = Date.now() - tQ;
-      if (q && q.available) {
+      if (q && q.available && q.scores) {
         qualityCheck = {
           passed: q.scores.consistency >= QC_THRESHOLD.consistency
             && q.scores.textReadability >= QC_THRESHOLD.textReadability
             && q.scores.edgeCleanliness >= QC_THRESHOLD.edgeCleanliness,
+          available: true,
           scores: q.scores,
           thresholds: QC_THRESHOLD,
           issues: q.issues || []
         };
       } else {
-        // 质检不可用：M2 放行，前端不据此拦截
+        // 质检超时/失败/不可用：passed=false, scores=null（前端显示 N/A，不落 0 分）
         qualityCheck = {
-          passed: true,
-          scores: (q && q.scores) || qualityCheck.scores,
+          passed: false,
+          available: false,
+          scores: null,
           thresholds: QC_THRESHOLD,
           issues: ['qc_unavailable'].concat((q && q.issues) || [])
         };
@@ -895,7 +904,8 @@ async function handlePipeline(req, env, origin) {
       timing.quality = Date.now() - tQ;
       qualityCheck = {
         passed: false,
-        scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 },
+        available: false,
+        scores: null,
         thresholds: QC_THRESHOLD,
         issues: ['cutout_failed_no_product_png']
       };
@@ -903,28 +913,22 @@ async function handlePipeline(req, env, origin) {
   } catch (e) {
     timing.quality = Date.now() - tQ;
     qualityCheck = {
-      passed: true,
-      scores: qualityCheck.scores,
+      passed: false,
+      available: false,
+      scores: null,
       thresholds: QC_THRESHOLD,
       issues: ['qc_error', String((e && e.message) || e)]
     };
   }
 
-  // M2 额度扣减：pipeline 成功后扣 1 包（先月度、后加量包），并记录使用日志
-  let quotaDeducted = null;
+  // M2 支付/额度预留：非阻塞记录调用次数
   try {
-    const ded = await checkAndDeductQuota(env, session.id);
-    if (ded.ok) quotaDeducted = { deductedFrom: ded.deductedFrom, remaining: ded.remaining };
-    // 非阻塞使用日志：usage:<memberId>:<ts>，TTL 30 天，便于对账排查
-    try {
-      await env.MEMBERS.put('usage:' + session.id + ':' + Date.now(),
-        JSON.stringify({ at: Date.now(), cost: 1, deductedFrom: ded.deductedFrom || null }),
-        { expirationTtl: 30 * 24 * 3600 });
-    } catch (e2) {}
-  } catch (e) {
-    // 扣减失败不阻断已生成结果（下次 /api/member/me 会暴露），仅记录
-    errors.push({ step: 'quota.deduct', message: String((e && e.message) || e) });
-  }
+    if (env.MEMBERS) {
+      const k = 'pipeline:' + session.id;
+      const n = parseInt(await env.MEMBERS.get(k), 10) || 0;
+      await env.MEMBERS.put(k, String(n + 1));
+    }
+  } catch (e) {}
 
   timing.total = Date.now() - tStart;
 
@@ -951,8 +955,7 @@ async function handlePipeline(req, env, origin) {
     timing,
     errors,
     exportSpecs: EXPORT_SPECS_M2,
-    videoReady: false,
-    quota: quotaDeducted
+    videoReady: false
   }, 200, origin);
 }
 
