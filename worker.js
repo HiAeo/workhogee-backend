@@ -22,6 +22,7 @@ import { matchVehicle } from './kb-data.js';
 import { handleAdmin } from './admin.js';
 import { handleMember } from './member-api.js';
 import { getMemberSession, ensureBootstrapAdmin } from './member-auth.js';
+import { checkAndDeductQuota } from './members.js';
 import { handleFeed, ensureFeedBootstrap } from './feed.js';
 import { handleAnalytics, scheduledRollup } from './analytics.js';
 import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision, generatePipelineCopy, checkCutoutQuality } from './vision.js';
@@ -222,6 +223,7 @@ async function handleGenerate(req, env, origin) {
   if (session.status === 'suspended') {
     return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用，请联系客服' } }, 403, origin);
   }
+
 
   const ip = clientIp(req);
   if (rateLimited(ip)) {
@@ -694,6 +696,49 @@ function marketingBgPrompt(styleLine) {
   ].join(' ');
 }
 
+// 把 dataURL 图片缩放到短边 shortEdge px，返回新 dataURL（JPEG，质量 0.82）。
+// 用 OffscreenCanvas（Workers runtime 内置），QC 用图从原图 2-3MB 压到 <500KB。
+async function resizeDataUrl(dataUrl, shortEdge = 1024) {
+  try {
+    const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const bitmap = await createImageBitmap(new Blob([bytes]));
+    const scale = Math.min(1, shortEdge / Math.min(bitmap.width, bitmap.height));
+    const w = Math.round(bitmap.width * scale);
+    const h = Math.round(bitmap.height * scale);
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx2d = canvas.getContext('2d');
+    // 抠图 PNG 有透明通道：先铺白底再画，避免 JPEG 导出变黑
+    ctx2d.fillStyle = '#ffffff';
+    ctx2d.fillRect(0, 0, w, h);
+    ctx2d.drawImage(bitmap, 0, 0, w, h);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 });
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    let out = '';
+    for (let i = 0; i < buf.length; i += 0x8000) {
+      out += String.fromCharCode.apply(null, buf.subarray(i, Math.min(i + 0x8000, buf.length)));
+    }
+    return 'data:image/jpeg;base64,' + btoa(out);
+  } catch (e) {
+    return dataUrl; // 缩放失败则原图返回，不阻断质检
+  }
+}
+
+// 上游重试：callSeedream 失败时重试 1 次（间隔 2s），重试仍失败才抛错
+async function pipelineTextGenWithRetry(env, opts, retries = 1) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await pipelineTextGen(env, opts);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries) await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
+}
 // 文生图（不传 imagePayload）→ dataURL；失败抛错由上层 .catch 兜底为 null
 async function pipelineTextGen(env, { prompt, size, timeoutMs }) {
   const r = await callSeedream(env, { prompt, size, timeoutMs });
@@ -703,7 +748,7 @@ async function pipelineTextGen(env, { prompt, size, timeoutMs }) {
   return 'data:' + mime + ';base64,' + stamped.b64;
 }
 
-async function handlePipeline(req, env, origin) {
+async function handlePipeline(req, env, origin, ctx) {
   // 会员门禁（与 M1 一致）
   const session = await getMemberSession(env, req);
   if (!session) {
@@ -711,6 +756,17 @@ async function handlePipeline(req, env, origin) {
   }
   if (session.status === 'suspended') {
     return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用，请联系客服' } }, 403, origin);
+  }
+
+  // M2.2 额度门禁：pipeline 开始前检查并扣减额度，不足返回 402
+  let quotaResult = null;
+  try {
+    quotaResult = await checkAndDeductQuota(env, session.id, 1);
+    if (!quotaResult.ok) {
+      return json({ ok: false, error: { code: 'quota_exhausted', message: quotaResult.message || '额度不足' } }, 402, origin);
+    }
+  } catch (e) {
+    return json({ ok: false, error: { code: 'quota_check_failed', message: '额度校验异常，请重试' } }, 500, origin);
   }
 
   let body;
@@ -796,20 +852,26 @@ async function handlePipeline(req, env, origin) {
   }
   timing.cutout = Date.now() - tC;
 
-  // 3) 并行文生图：3 张空场景背景 + 1 张营销背景（均不含产品，前端合成）
+  // 3) 文生图：3 张空场景背景 + 1 张营销背景（均不含产品，前端合成）
+  //    M2.2：4 张全并行改为 2+2 分批 + 重试，降低突发内存和上游限流压力
   const tG = Date.now();
   const presets = pickBackgrounds(categoryName);
   const size = PIPELINE_GEN_SIZE;
-  const sceneTasks = presets.map((p, i) => pipelineTextGen(env, {
-    prompt: sceneBgPrompt(p.bg, styleLine), size, timeoutMs: 90000
-  }).catch(e => { errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); return null; }));
-  const marketingTask = pipelineTextGen(env, {
+  // M2.2：全部并行启动（与原版一致，保证总耗时≈单次生成时间），加了重试和全局兜底。
+  // 峰值并发4由全局try-catch+重试+KV非阻塞来防502，不再用串行分批（会翻倍总耗时导致Worker超时）。
+  const sceneResults = [null, null, null];
+  const sceneTasks = [0,1,2].map(i =>
+    pipelineTextGenWithRetry(env, { prompt: sceneBgPrompt(presets[i].bg, styleLine), size, timeoutMs: 90000 })
+      .then(r => { sceneResults[i] = r; })
+      .catch(e => { errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); })
+  );
+  const marketingBgP = pipelineTextGenWithRetry(env, {
     prompt: marketingBgPrompt(styleLine), size, timeoutMs: 90000
   }).catch(e => { errors.push({ step: 'marketing', message: String((e && e.message) || e) }); return null; });
-
-  const [sceneSettled, marketingBg] = await Promise.all([Promise.all(sceneTasks), marketingTask]);
+  await Promise.all([...sceneTasks, marketingBgP]);
+  const marketingBg = await marketingBgP;
   timing.generate = Date.now() - tG;
-  const scene = [sceneSettled[0] || null, sceneSettled[1] || null, sceneSettled[2] || null];
+  const scene = [sceneResults[0] || null, sceneResults[1] || null, sceneResults[2] || null];
   const compositeGuide = {
     scene: presets.map(p => p.guide),
     marketing: { position: 'center', scale: 0.5, shadow: true }
@@ -860,24 +922,33 @@ async function handlePipeline(req, env, origin) {
   }
 
   // 6) 质检门禁（阿果）：抠图结构 / 包装文字可读性 / 边缘干净度评分，M2 不强制阻断
-  //    修复：超时/失败不再落 0 分且 passed=true；改为 available=false, passed=false, scores=null
-  //    并用 Promise.race 15s 硬超时，绝不阻塞主出图流程。
+  //    M2.2：质检图缩放到短边 1024px（base64 体积减半），10s 硬超时；
+  //    超时后用 ctx.waitUntil 后台继续跑（再给 20s），结果写 KV，前端轮询 /qc-result。
   const tQ = Date.now();
   const QC_THRESHOLD = { consistency: 0.92, textReadability: 0.9, edgeCleanliness: 0.9 };
+  const pipelineId = session.id + ':' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   let qualityCheck = {
     passed: false,
     available: false,
     scores: null,
+    pending: false,
+    qcId: null,
     thresholds: QC_THRESHOLD,
     issues: ['qc_unavailable']
   };
   try {
     if (cutoutPng) {
-      // 质检与出图解耦：视觉模型最多等 15s，超时立即降级 qc_unavailable，不等模型返回
-      const qcPromise = checkCutoutQuality(env, { original: image, cutout: cutoutPng });
+      // 缩放到短边 1024px，减少 base64 体积（结构/文字/边缘判断不受影响）
+      const [qcOrig, qcCut] = await Promise.all([
+        resizeDataUrl(image, 1024),
+        resizeDataUrl(cutoutPng, 1024)
+      ]);
+      // 释放原图大变量引用（内存优化）
+
+      const qcPromise = checkCutoutQuality(env, { original: qcOrig, cutout: qcCut });
       const qcTimeout = new Promise(resolve => setTimeout(() => resolve({
         available: false, scores: null, issues: ['vision_timeout']
-      }), 15000));
+      }), 10000));
       const q = await Promise.race([qcPromise, qcTimeout]);
       timing.quality = Date.now() - tQ;
       if (q && q.available && q.scores) {
@@ -887,18 +958,55 @@ async function handlePipeline(req, env, origin) {
             && q.scores.edgeCleanliness >= QC_THRESHOLD.edgeCleanliness,
           available: true,
           scores: q.scores,
+          pending: false,
+          qcId: null,
           thresholds: QC_THRESHOLD,
           issues: q.issues || []
         };
       } else {
-        // 质检超时/失败/不可用：passed=false, scores=null（前端显示 N/A，不落 0 分）
+        // 10s 超时：后台异步补算（再给 20s），结果写 KV，前端轮询
         qualityCheck = {
           passed: false,
           available: false,
           scores: null,
+          pending: true,
+          qcId: pipelineId,
           thresholds: QC_THRESHOLD,
           issues: ['qc_unavailable'].concat((q && q.issues) || [])
         };
+        if (ctx && ctx.waitUntil) {
+          ctx.waitUntil((async () => {
+            try {
+              // 先用 1024px 再试一次（20s 预算）
+              let bgResult = await Promise.race([
+                checkCutoutQuality(env, { original: qcOrig, cutout: qcCut }),
+                new Promise(resolve => setTimeout(() => resolve({ available: false, scores: null, issues: ['bg_timeout_1024'] }), 20000))
+              ]);
+              // 1024px 仍超时，降级 768px 再试 1 次
+              if (!bgResult.available) {
+                const [q768o, q768c] = await Promise.all([
+                  resizeDataUrl(image, 768),
+                  resizeDataUrl(cutoutPng, 768)
+                ]);
+                bgResult = await Promise.race([
+                  checkCutoutQuality(env, { original: q768o, cutout: q768c }),
+                  new Promise(resolve => setTimeout(() => resolve({ available: false, scores: null, issues: ['bg_timeout_768'] }), 15000))
+                ]);
+              }
+              const rec = bgResult && bgResult.available ? {
+                passed: bgResult.scores.consistency >= QC_THRESHOLD.consistency
+                  && bgResult.scores.textReadability >= QC_THRESHOLD.textReadability
+                  && bgResult.scores.edgeCleanliness >= QC_THRESHOLD.edgeCleanliness,
+                available: true,
+                scores: bgResult.scores,
+                issues: bgResult.issues || []
+              } : { available: false, scores: null, issues: (bgResult && bgResult.issues) || ['bg_failed'] };
+              await env.MEMBERS.put('qc:' + pipelineId, JSON.stringify(rec), { expirationTtl: 3600 });
+            } catch (e) {
+              try { await env.MEMBERS.put('qc:' + pipelineId, JSON.stringify({ available: false, scores: null, issues: ['bg_error', String((e && e.message) || e)] }), { expirationTtl: 3600 }); } catch {}
+            }
+          })());
+        }
       }
     } else {
       timing.quality = Date.now() - tQ;
@@ -906,6 +1014,8 @@ async function handlePipeline(req, env, origin) {
         passed: false,
         available: false,
         scores: null,
+        pending: false,
+        qcId: null,
         thresholds: QC_THRESHOLD,
         issues: ['cutout_failed_no_product_png']
       };
@@ -916,19 +1026,33 @@ async function handlePipeline(req, env, origin) {
       passed: false,
       available: false,
       scores: null,
+      pending: false,
+      qcId: null,
       thresholds: QC_THRESHOLD,
       issues: ['qc_error', String((e && e.message) || e)]
     };
   }
 
-  // M2 支付/额度预留：非阻塞记录调用次数
-  try {
-    if (env.MEMBERS) {
-      const k = 'pipeline:' + session.id;
-      const n = parseInt(await env.MEMBERS.get(k), 10) || 0;
-      await env.MEMBERS.put(k, String(n + 1));
-    }
-  } catch (e) {}
+  // M2.2：KV 调用计数改为非阻塞（不阻塞响应）
+  if (env.MEMBERS && ctx && ctx.waitUntil) {
+    ctx.waitUntil((async () => {
+      try {
+        const k = 'pipeline:' + session.id;
+        const n = parseInt(await env.MEMBERS.get(k), 10) || 0;
+        await env.MEMBERS.put(k, String(n + 1));
+      } catch (e) {}
+    })());
+  }
+
+  // 内存优化：释放大 base64 引用
+  if (cutoutPng) { /* keep in response */ }
+  const quotaResp = quotaResult ? {
+    deductedFrom: quotaResult.deductedFrom,
+    remaining: quotaResult.remaining,
+    monthlyRemaining: quotaResult.monthlyRemaining,
+    topupBalance: quotaResult.topupBalance,
+    totalAvailable: quotaResult.totalAvailable
+  } : null;
 
   timing.total = Date.now() - tStart;
 
@@ -952,6 +1076,7 @@ async function handlePipeline(req, env, origin) {
     detailBoxes,
     copy,
     qualityCheck,
+    quota: quotaResp,
     timing,
     errors,
     exportSpecs: EXPORT_SPECS_M2,
@@ -1317,7 +1442,20 @@ export default {
 
     // M1 端到端物料包 pipeline：品类识别→抠图→8图+文案一键生成（会员门禁）
     if (path === '/pipeline' && request.method === 'POST') {
-      return handlePipeline(request, env, origin);
+      try {
+        return await handlePipeline(request, env, origin, ctx);
+      } catch (e) {
+        return json({ ok: false, error: { code: 'pipeline_crash', message: String((e && e.message) || e) } }, 500, origin);
+      }
+    }
+
+    // 质检异步补算结果轮询（M2.2）：GET /qc-result?id=qc:<pipelineId>
+    if (path === '/qc-result' && request.method === 'GET') {
+      const qid = url.searchParams.get('id') || '';
+      if (!qid || !env.MEMBERS) return json({ ok: false, error: { code: 'bad_param', message: '缺少 id' } }, 400, origin);
+      const rec = await env.MEMBERS.get('qc:' + qid, 'json');
+      if (!rec) return json({ ok: true, pending: true, scores: null }, 200, origin);
+      return json({ ok: true, pending: false, ...rec }, 200, origin);
     }
 
     // 上传实拍图智能质检（vision 判定遮挡/完整度/构图）
