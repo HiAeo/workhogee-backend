@@ -1,0 +1,19 @@
+# 本地 `wrangler dev` 使用的环境变量样例。
+# 复制为 .dev.vars 并填入真实值（.dev.vars 已被 .gitignore 忽略，切勿提交）。
+# 生产环境：机密用 `wrangler secret put <NAME>`；非机密的 ARK_MODEL / ARK_ENDPOINT 也可写在 wrangler.toml [vars]。
+
+# 火山方舟 API Key（账号/项目级，图像生成必需）
+ARK_API_KEY=在此粘贴你的方舟APIKey
+# 图像生成推理接入点 ep-id（Seedream）
+ARK_MODEL=ep-xxxxxxxx
+ARK_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3/images/generations
+
+# 视觉理解（W1 主体一致性 / 隐私后验）：
+# 在方舟控制台「开通视觉模型按量直连」或「创建视觉推理接入点」，推荐后者并把 VISION_MODEL 填为 ep-xxxx。
+# 视觉接入点若在不同项目/使用独立 Key，填 VISION_API_KEY；与图像同一把 Key 时留空，自动回退 ARK_API_KEY。
+# VISION_API_KEY=
+# VISION_MODEL=ep-你的视觉接入点
+VISION_ENDPOINT=https://ark.cn-beijing.volces.com/api/v3/chat/completions
+
+# 埋点 / KV 本地加密密钥（线上为独立 secret；可填一个随机 32 字节 base64 串）
+DATA_KEY=请填一个随机32字节base64密钥

@@ -1,0 +1,28 @@
+# 依赖 / 构建
+node_modules/
+.wrangler/
+_dryrun/
+_dryrun_new/
+
+# 本地密钥（绝不提交）
+.dev.vars
+*.local
+
+# 诊断 / 测试 / 探针脚本（可能含本地凭据）
+diag_*.mjs
+test_*.mjs
+selftest*.mjs
+_selftest*.mjs
+_probe*.mjs
+e2e-*.mjs
+clean_kv.mjs
+
+# 临时补丁与日志
+*.log
+_*.txt
+_*.py
+del_keys.json
+
+# 系统
+.DS_Store
+Thumbs.db

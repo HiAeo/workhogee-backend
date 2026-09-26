@@ -1,0 +1,24 @@
+name = "workhogee-image-api"
+main = "worker.js"
+compatibility_date = "2026-09-16"
+workers_dev = true
+
+[vars]
+ARK_MODEL = "doubao-seedream-4-5-251128"
+ARK_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+
+# 火山引擎 TOS 对象存储（跨端同步原图/成品图；非机密配置）。
+# IAM AccessKey ID / Secret 用 `wrangler secret put` 配置，不写在这里。
+TOS_BUCKET = "workhogee-assets"
+TOS_REGION = "cn-beijing"
+TOS_ENDPOINT = "tos-cn-beijing.volces.com"
+
+# 会员 / 管理员会话数据（Cloudflare KV）
+# 命名空间：workhogee-members
+[[kv_namespaces]]
+binding = "MEMBERS"
+id = "9e2aaf28b3e44573af8dc5f68dfb9d5d"
+
+# 效果中心：每小时第 7 分把埋点增量分片 inc:* rollup 进日汇总 day:*
+[triggers]
+crons = ["7 * * * *"]

@@ -1,0 +1,16 @@
+{
+  "name": "workhogee-image-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WorkHogee 生图伙计 · Cloudflare Worker 薄代理：服务端保管火山 Seedream 密钥，提供生成代理与车型知识库接口",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "secret": "wrangler secret put ARK_API_KEY",
+    "logs": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
