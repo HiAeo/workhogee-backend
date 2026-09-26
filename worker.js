@@ -1,4 +1,4 @@
-﻿/* =====================================================================
+/* =====================================================================
  * WorkHogee 生图伙计 · Cloudflare Worker 薄代理层
  * ---------------------------------------------------------------------
  * 职责（刻意保持“薄”）：
@@ -24,7 +24,7 @@ import { handleMember } from './member-api.js';
 import { getMemberSession, ensureBootstrapAdmin } from './member-auth.js';
 import { handleFeed, ensureFeedBootstrap } from './feed.js';
 import { handleAnalytics, scheduledRollup } from './analytics.js';
-import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision } from './vision.js';
+import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision, generatePipelineCopy, checkCutoutQuality } from './vision.js';
 import { stampImageMeta } from './image-meta.js';
 import { presignPut, presignGet } from './tos.js';
 import { segmentEntities, superResolve, saliencySegment, goodsSegment, carPlateDetection } from './cv.js';
@@ -612,43 +612,85 @@ async function handleSuperRes(req, env, origin) {
 }
 
 /* =====================================================================
- * M1 端到端物料包 pipeline（POST /pipeline）
+ * M2 端到端物料包 pipeline（POST /pipeline）—— 图层合成架构
  * ---------------------------------------------------------------------
- * 编排：品类识别 → BiRefNet 抠图(失败降级 RMBG-2.0) → 并行生成 8 图
- *   (2 白底 + 3 场景 + 2 细节 + 1 营销) + 1 套文案 → 返回全部 dataURL。
- * 设计纪律：
- *   - 会员门禁复用 getMemberSession；单图失败不阻断整体（该位置 null，errors 记录）；
- *   - 生成类调用 Promise.all 并行；白底优先用抠图直出（不额外花一次生成）；
- *   - Worker 无 Canvas，多规格尺寸变换（淘宝 800 / 小红书 3:4 / Amazon 2000）
- *     一律在前端 Canvas 完成，后端只给高分辨率原图 + exportSpecs 说明；
- *   - M2 预留：verifyConsistency 只记录不阻断、调用次数非阻塞计数、videoReady 占位。
+ * 核心纪律：产品像素绝不重绘。
+ *   - 后端只生成"不含产品的空背景"（Seedream 文生图，不传参考图）；
+ *   - 产品 = BiRefNet/RMBG 抠出的透明 PNG，由前端浏览器 Canvas 合成；
+ *   - 白底图 = 同一张抠图 PNG（前端贴白底），后端不再生成白底图；
+ *   - 细节图 = 原图按 bbox 裁剪 + 前端 /superres 超分，后端只返回 bbox；
+ *   - 始终调用 identifyProduct 提取真实属性（category 仅用于场景路由，不跳过识别）；
+ *   - 文案基于真实属性，结构化输出，禁止模板化/占位；
+ *   - 末尾抠图质检评分（不阻断，前端展示分数）。
+ * 降级：抠图 autodl→gitee；背景生成失败该位 null；错误进 errors 数组。
  * ===================================================================*/
 const PIPELINE_GEN_SIZE = DEFAULT_SIZE; // 2048x2048（火山图像像素下限合规）
-const EXPORT_SPECS = [
-  { name: '淘宝主图', size: '800x800', transform: 'resize', note: '前端 Canvas 缩放' },
-  { name: '小红书', size: '1536x2048', ratio: '3:4', transform: 'crop', note: '前端 Canvas 裁切' },
-  { name: 'Amazon主图', size: '2000x2000', transform: 'resize-white', note: '用后端白底图导出，纯白底合规' }
+const EXPORT_SPECS_M2 = [
+  { name: '淘宝', size: '800x800', transform: 'resize', note: '前端 Canvas 缩放，用合成后的白底主图' },
+  { name: '小红书', size: '3:4', ratio: '3:4', transform: 'crop', note: '前端 Canvas 裁切' },
+  { name: 'Amazon', size: '2000x2000', transform: 'resize', note: '纯白底合规，前端贴白底导出' }
 ];
 
-// 品类 → 3 个生活场景提示词（M1 按主流类目预设，未命中走通用场景）
-const CATEGORY_SCENES = {
-  '家居百货': ['北欧风客厅一角，自然光洒落，浅木色家具与绿植点缀', 'ins 风木质桌面，咖啡杯与香薰蜡烛营造温馨氛围', '简约书架旁的生活角落，书籍与收纳盒整齐摆放'],
-  '3C数码': ['科技感极简办公桌，柔和冷色氛围灯，笔记本电脑旁', '纯白色极简背景桌面，干净利落，产品居中', '现代开放式办公场景，明亮落地窗自然光'],
-  '美妆个护': ['ins 风梳妆台，大理石台面，柔和美妆灯光', '浴室大理石台面，白毛巾与尤加利叶点缀', 'ins 风桌面，香水瓶与浅粉花束搭配，柔光'],
-  '服饰鞋包': ['城市街头自然光街拍，浅灰建筑背景', '简约衣架陈列，浅色水泥墙面，自然侧光', '纯色摄影棚背景，简约穿搭站姿展示'],
-  '食品餐饮': ['美食摄影，木质餐桌，窗边自然光，餐具搭配', '现代厨房台面场景，整洁明亮', '暖调木质桌面，暖色食物氛围光']
+// 品类 → 3 个空场景背景预设 + 合成建议（M2：只生空背景，绝不带产品/物体）
+const CATEGORY_BG_PRESETS = {
+  '家居百货': [
+    { bg: '北欧风客厅一角，浅木色地板，窗边自然光洒落，沙发与绿植在背景中虚化，画面中央地面干净空旷、预留摆放商品的位置', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'warm' } },
+    { bg: 'ins风浅木色桌面特写背景，柔光从侧方打来，背景虚化有绿植点缀，中央台面干净空旷留白', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'warm' } },
+    { bg: '简约浅色书架旁的生活角落，书籍与收纳盒整齐排列，自然侧光，中央台面干净预留商品位置', guide: { position: 'center', scale: 0.5, shadow: true, colorTemp: 'natural' } }
+  ],
+  '3C数码': [
+    { bg: '科技感极简白色桌面，柔和冷色氛围灯，画面空旷干净，中央台面预留摆放数码配件的位置', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'cool' } },
+    { bg: '纯白色极简影棚背景，无影棚均匀柔光，地面干净无杂物，中央大面积留白', guide: { position: 'center', scale: 0.65, shadow: false, colorTemp: 'cool' } },
+    { bg: '极简桌面搭配淡蓝色霓虹灯氛围光，现代科技感，背景适度虚化，中央台面干净留白', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'cool' } }
+  ],
+  '美妆个护': [
+    { bg: 'ins风大理石梳妆台台面，柔和美妆环形白光，背景虚化有花束，中央台面干净预留商品位置', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'warm' } },
+    { bg: '粉色柔光灯下的大理石台面，浅粉玫瑰与纱幔点缀，干净高级，中央台面留白', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'warm' } },
+    { bg: '现代浴室大理石台面，白毛巾与尤加利叶点缀，自然光从窗户射入，中央台面干净预留位置', guide: { position: 'center', scale: 0.5, shadow: true, colorTemp: 'natural' } }
+  ],
+  '服饰鞋包': [
+    { bg: '城市街头自然光街景，浅灰建筑与人行道在远处虚化，路面中央干净空旷预留摆放位置', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'natural' } },
+    { bg: '简约衣帽间，浅色水泥墙面与开放式衣架，自然侧光，中央地面干净留白', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'natural' } },
+    { bg: '咖啡馆木质桌面场景，虚化的咖啡杯与暖黄吊灯，中央桌面干净预留商品位置', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'warm' } }
+  ],
+  '食品餐饮': [
+    { bg: '美食摄影木质餐桌，窗边自然光，餐具与绿植在旁点缀，桌面中央干净预留摆放食品的位置', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'warm' } },
+    { bg: '现代厨房台面场景，整洁明亮，窗外自然光，中央台面干净留白', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'natural' } },
+    { bg: '自然光野餐场景，浅色餐布上铺着花篮与藤编篮，背景草地虚化，中央餐布干净预留食品位置', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'warm' } }
+  ]
 };
-function pickScenes(category) {
+const GENERIC_BG_PRESETS = [
+  { bg: '明亮简约的生活化场景背景，自然光，浅色调，画面中央干净空旷预留摆放商品的位置', guide: { position: 'center', scale: 0.55, shadow: true, colorTemp: 'natural' } },
+  { bg: 'ins风木质桌面，柔和氛围光，背景适度虚化，中央台面干净留白', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'warm' } },
+  { bg: '浅色干净摄影棚背景，柔和侧光，地面整洁，中央大面积留白待合成商品', guide: { position: 'center', scale: 0.6, shadow: true, colorTemp: 'natural' } }
+];
+function pickBackgrounds(category) {
   const c = String(category || '');
-  for (const key of Object.keys(CATEGORY_SCENES)) {
-    if (c.includes(key.slice(0, 2)) || c.includes(key)) return CATEGORY_SCENES[key];
+  for (const key of Object.keys(CATEGORY_BG_PRESETS)) {
+    if (c.includes(key.slice(0, 2)) || c.includes(key)) return CATEGORY_BG_PRESETS[key];
   }
-  return ['明亮简约家居场景，自然光，浅色调', 'ins 风木质桌面，柔和氛围光', '浅色干净背景，柔和侧光，高级商业摄影'];
+  return GENERIC_BG_PRESETS;
 }
 
-// callSeedream {b64}/{error} → dataURL；失败抛错，由上层 .catch 兜底为 null
-async function pipelineGen(env, { prompt, imagePayload, size, timeoutMs }) {
-  const r = await callSeedream(env, { prompt, imagePayload, size, timeoutMs });
+// 文生图 prompt：明确"空场景、无产品/物体/文字"，供前端保真合成（绝不重绘产品）
+function sceneBgPrompt(bgDesc, styleLine) {
+  return [
+    'Empty e-commerce product photography background. Scene: ' + bgDesc + '.',
+    'Absolutely NO product, NO object, NO person, NO animal, NO vehicle, NO text, NO logo, NO watermark in the frame.',
+    'The center area must be clean and uncluttered, deliberately left empty for later product compositing. High-end commercial photography, natural depth of field, realistic soft lighting.' + (styleLine ? ' Overall style: ' + styleLine + '.' : '')
+  ].join(' ');
+}
+function marketingBgPrompt(styleLine) {
+  return [
+    'E-commerce promotional poster background, festive but clean, soft gradient with light decorative elements (ribbons, sparkles, soft geometric shapes).',
+    'The CENTER must be a completely empty, uncluttered area reserved for later product compositing.',
+    'Absolutely NO product, NO text, NO logo, NO human figure. Professional commercial advertising layout, bright and premium mood.' + (styleLine ? ' Overall style: ' + styleLine + '.' : '')
+  ].join(' ');
+}
+
+// 文生图（不传 imagePayload）→ dataURL；失败抛错由上层 .catch 兜底为 null
+async function pipelineTextGen(env, { prompt, size, timeoutMs }) {
+  const r = await callSeedream(env, { prompt, size, timeoutMs });
   if (r.error) throw new Error((r.error && r.error.code) || 'seedream_failed');
   const stamped = stampImageMeta(r.b64);
   const mime = stamped.mime && stamped.mime !== 'image/unknown' ? stamped.mime : 'image/jpeg';
@@ -656,7 +698,7 @@ async function pipelineGen(env, { prompt, imagePayload, size, timeoutMs }) {
 }
 
 async function handlePipeline(req, env, origin) {
-  // 会员门禁（M2 支付/额度预留：此处记录调用次数）
+  // 会员门禁（与 M1 一致）
   const session = await getMemberSession(env, req);
   if (!session) {
     return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号后再生成物料包' } }, 401, origin);
@@ -678,132 +720,125 @@ async function handlePipeline(req, env, origin) {
   }
   const userCategory = String((body && body.category) || '').slice(0, 50);
   const style = String((body && body.style) || '').slice(0, 100);
-  const styleLine = style ? ('整体风格：' + style + '。') : '';
+  const styleLine = style ? style : '';
 
   const errors = [];
   const tStart = Date.now();
-  const timing = { identify: 0, cutout: 0, generate: 0, copy: 0, total: 0 };
+  const timing = { identify: 0, cutout: 0, generate: 0, copy: 0, quality: 0, total: 0 };
 
-  // 1) 品类识别（用户已传 category 则跳过自动识别）
-  let categoryInfo = { name: userCategory || '商品', confidence: 1, source: userCategory ? 'user' : 'auto', fields: {} };
-  if (!userCategory) {
-    const t0 = Date.now();
-    try {
-      const id = await identifyProduct(env, image);
-      timing.identify = Date.now() - t0;
-      if (id && id.available) {
-        const f = id.fields || {};
+  // 1) 强制视觉属性提取：无论是否传 category 都跑 identifyProduct。
+  //    category 仅用于场景路由；source 区分 user / vision / user+vision。
+  const tI = Date.now();
+  let productAttributes = { productName: '', material: '', color: '', sellingPoints: [], packagingText: '' };
+  let categoryInfo = { name: userCategory || '商品', confidence: userCategory ? 1 : 0.8, source: userCategory ? 'user' : 'vision', fields: {} };
+  try {
+    const id = await identifyProduct(env, image);
+    timing.identify = Date.now() - tI;
+    if (id && id.available && id.fields) {
+      const f = id.fields;
+      productAttributes = {
+        productName: String(f.name || ''),
+        material: String(f.material || ''),
+        color: String(f.color || ''),
+        sellingPoints: Array.isArray(f.sellingPoints) ? f.sellingPoints.map(String).slice(0, 5) : [],
+        packagingText: String(f.packagingText || '')
+      };
+      if (!userCategory) {
         categoryInfo = {
           name: f.category || f.kind || f.name || '商品',
           confidence: Number(f.confidence) || 0.8,
-          source: 'auto',
+          source: 'vision',
           fields: f
         };
+      } else {
+        categoryInfo = { name: userCategory, confidence: 0.9, source: 'user+vision', fields: f };
       }
-    } catch (e) {
-      timing.identify = Date.now() - t0;
-      errors.push({ step: 'identify', message: String((e && e.message) || e) });
     }
+  } catch (e) {
+    timing.identify = Date.now() - tI;
+    errors.push({ step: 'identify', message: String((e && e.message) || e) });
   }
   const categoryName = categoryInfo.name || '商品';
-  const sellingPoints = Array.isArray(categoryInfo.fields.sellingPoints)
-    ? categoryInfo.fields.sellingPoints.map(String).slice(0, 5) : [];
 
-  // 2) 抠图：autodl(BiRefNet) 优先，失败降级 gitee(RMBG-2.0)
+  // 2) 抠图：autodl(BiRefNet) 优先，失败降级 gitee(RMBG-2.0)。
+  //    M2 只返回透明 PNG 给前端合成，不再生成白底图。
   const tC = Date.now();
   let cutout = null;
   let cutoutStrategy = 'none';
-  let cutoutWhite = null;
   let cutoutPng = null;
+  let cutoutMask = null;
   const ac = await autodlCutout(env, image);
   if (ac.ok) {
     cutout = ac; cutoutStrategy = 'autodl';
-    cutoutWhite = ac.white; cutoutPng = ac.image;
+    cutoutPng = ac.image; cutoutMask = ac.mask || null;
   } else {
     errors.push({ step: 'cutout.autodl', message: (ac.error && ac.error.code) || 'autodl_failed' });
     const gm = await giteeMatting(env, image);
     if (gm.ok) {
       cutout = gm; cutoutStrategy = 'gitee';
-      cutoutPng = gm.image; // RMBG 只给透明 PNG，无内置白底（white 由 Seedream 生成）
+      cutoutPng = gm.image;
     } else {
       errors.push({ step: 'cutout.gitee', message: (gm.error && gm.error.code) || 'gitee_failed' });
     }
   }
   timing.cutout = Date.now() - tC;
-  const productRef = cutoutPng || image; // 以透明抠图为参考；抠图失败则退回原图
 
-  // 3) 并行生成 8 图（场景3 + 细节2 + 营销1 全部并行；白底按是否有直出白底决定生成数量）
+  // 3) 并行文生图：3 张空场景背景 + 1 张营销背景（均不含产品，前端合成）
   const tG = Date.now();
+  const presets = pickBackgrounds(categoryName);
   const size = PIPELINE_GEN_SIZE;
-  const scenes = pickScenes(categoryName);
-  const genTasks = {};
+  const sceneTasks = presets.map((p, i) => pipelineTextGen(env, {
+    prompt: sceneBgPrompt(p.bg, styleLine), size, timeoutMs: 90000
+  }).catch(e => { errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); return null; }));
+  const marketingTask = pipelineTextGen(env, {
+    prompt: marketingBgPrompt(styleLine), size, timeoutMs: 90000
+  }).catch(e => { errors.push({ step: 'marketing', message: String((e && e.message) || e) }); return null; });
 
-  // 白底 slot0：autodl 直出白底直接用（不花生成）；gitee 兜底时才生成第一张
-  if (!cutoutWhite) {
-    genTasks.white0 = pipelineGen(env, {
-      prompt: appendGuardClauses('电商纯白底产品主图：参考图中的商品本体保持完全一致，正放在纯白背景（RGB 255,255,255）正中央，产品占画面约 85%，四周留白均匀，无影棚柔和灯光，高分辨率商业摄影。' + styleLine),
-      imagePayload: productRef, size, timeoutMs: 110000
-    }).catch(e => { errors.push({ step: 'white.0', message: String((e && e.message) || e) }); return null; });
-  }
-  // 白底 slot1：第二张不同角度/构图的白底（始终生成，丰富合规主图选择）
-  genTasks.white1 = pipelineGen(env, {
-    prompt: appendGuardClauses('电商纯白底产品主图：参考图中的商品本体保持完全一致，轻微自然透视角度，放置在纯白背景（RGB 255,255,255）中央，产品占画面约 85%，光影柔和立体，高分辨率商业摄影。' + styleLine),
-    imagePayload: productRef, size, timeoutMs: 110000
-  }).catch(e => { errors.push({ step: 'white.1', message: String((e && e.message) || e) }); return null; });
+  const [sceneSettled, marketingBg] = await Promise.all([Promise.all(sceneTasks), marketingTask]);
+  timing.generate = Date.now() - tG;
+  const scene = [sceneSettled[0] || null, sceneSettled[1] || null, sceneSettled[2] || null];
+  const compositeGuide = {
+    scene: presets.map(p => p.guide),
+    marketing: { position: 'center', scale: 0.5, shadow: true }
+  };
 
-  // 3 张场景图
-  scenes.forEach((sc, i) => {
-    genTasks['scene' + i] = pipelineGen(env, {
-      prompt: appendGuardClauses('电商场景图：参考图中的商品本体保持完全一致（颜色/款式/材质不变），自然摆放在以下生活场景中——' + sc + '。商品自然融合环境光影，真实商业摄影质感，画面高级干净。' + styleLine),
-      imagePayload: productRef, size, timeoutMs: 110000
-    }).catch(e => { errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); return null; });
-  });
-
-  // 细节图：planDetails 取卖点 bbox（M1 记录 bbox 供前端裁剪），再 Seedream 高清重绘特写
+  // 4) 细节图：只回 bbox，前端原图裁剪 + /superres 超分（后端不重绘细节）
   const detailBoxes = [];
   try {
-    const pd = await planDetails(env, { image, category: categoryName });
-    if (pd && pd.ok && Array.isArray(pd.details)) pd.details.slice(0, 2).forEach(d => detailBoxes.push(d));
+    const pd = await planDetails(env, { image, category: categoryName, product: productAttributes.productName });
+    if (pd && pd.ok && Array.isArray(pd.details)) {
+      pd.details.slice(0, 2).forEach(d => detailBoxes.push({ label: d.label, bbox: d.bbox }));
+    }
   } catch (e) {
     errors.push({ step: 'details-plan', message: String((e && e.message) || e) });
   }
-  const detailLabels = detailBoxes.length
-    ? detailBoxes.map(d => d.label)
-    : ['核心材质与做工细节', '产品局部质感特写'];
-  detailLabels.forEach((label, i) => {
-    genTasks['detail' + i] = pipelineGen(env, {
-      prompt: appendGuardClauses('电商商品细节特写摄影：聚焦参考商品的「' + label + '」部位，高清放大展示材质纹理、做工工艺与局部设计，保持商品本体一致，干净浅色背景，柔和侧光突出质感。' + styleLine),
-      imagePayload: productRef, size, timeoutMs: 110000
-    }).catch(e => { errors.push({ step: 'detail.' + i, message: String((e && e.message) || e) }); return null; });
-  });
 
-  // 1 张营销图（带卖点文字排版）
-  genTasks.marketing = pipelineGen(env, {
-    prompt: appendGuardClauses('电商营销主图：突出参考图中的商品本体，画面简洁高级、排版干净留白适当，加入简洁的卖点文字排版（中文，清晰不乱码，不要多余文字），商业广告质感，光线明亮。' + styleLine),
-    imagePayload: productRef, size, timeoutMs: 110000
-  }).catch(e => { errors.push({ step: 'marketing', message: String((e && e.message) || e) }); return null; });
-
-  const settled = await Promise.all(Object.values(genTasks));
-  timing.generate = Date.now() - tG;
-  const out = {};
-  Object.keys(genTasks).forEach((k, i) => { out[k] = settled[i]; });
-
-  // 4) 文案生成
+  // 5) 文案：基于真实属性的结构化输出（title / 5 卖点 / 描述 / 三平台）
   const tCp = Date.now();
-  let copy = { title: categoryName, sellingPoints, description: '' };
+  let copy = {
+    title: productAttributes.productName || categoryName,
+    sellingPoints: productAttributes.sellingPoints.length
+      ? productAttributes.sellingPoints.map(s => '卖点：' + s)
+      : [categoryName + '：实拍原图，所见即所得'],
+    description: '',
+    channels: { taobao: '', xhs: '', amazon: '' }
+  };
   try {
-    const c = await generateCopy(env, {
-      product: (categoryInfo.fields && categoryInfo.fields.name) || categoryName,
-      category: categoryName,
-      sellingPoints,
-      channels: ['general']
+    const c = await generatePipelineCopy(env, {
+      productName: productAttributes.productName,
+      material: productAttributes.material,
+      color: productAttributes.color,
+      sellingPoints: productAttributes.sellingPoints,
+      packagingText: productAttributes.packagingText,
+      category: categoryName
     });
     timing.copy = Date.now() - tCp;
-    if (c && c.available && c.channels) {
+    if (c && c.available) {
       copy = {
-        title: c.channels.title || categoryName,
-        sellingPoints: sellingPoints.length ? sellingPoints : [categoryName + ' 精选好物'],
-        description: c.channels.general || ''
+        title: c.title || copy.title,
+        sellingPoints: c.sellingPoints.length ? c.sellingPoints : copy.sellingPoints,
+        description: c.description || '',
+        channels: c.channels || copy.channels
       };
     }
   } catch (e) {
@@ -811,25 +846,54 @@ async function handlePipeline(req, env, origin) {
     errors.push({ step: 'copy', message: String((e && e.message) || e) });
   }
 
-  // 组装 images：white 始终 2 张（直出白底优先，不足用生成白底补）
-  const white = [
-    cutoutWhite || out.white0 || out.white1 || null,
-    out.white1 || out.white0 || cutoutWhite || null
-  ];
-  const scene = [out.scene0 || null, out.scene1 || null, out.scene2 || null];
-  const detail = [out.detail0 || null, out.detail1 || null];
-  const marketing = out.marketing ? [out.marketing] : [null];
-
-  // M2 质检门禁预留：记录 verify 结果但不阻断（只对首张场景图做一次最佳努力后验）
-  const verify = { enabled: true, blocking: false, results: [] };
+  // 6) 质检门禁（阿果）：抠图结构 / 包装文字可读性 / 边缘干净度评分，M2 不强制阻断
+  const tQ = Date.now();
+  const QC_THRESHOLD = { consistency: 0.92, textReadability: 0.9, edgeCleanliness: 0.9 };
+  let qualityCheck = {
+    passed: true,
+    scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 },
+    thresholds: QC_THRESHOLD,
+    issues: ['qc_unavailable']
+  };
   try {
-    const target = scene[0] || marketing[0];
-    if (target) {
-      const v = await verifyConsistency(env, { originals: [image], result: target }, 20000);
-      verify.results.push({ target: 'scene0', available: !!v.available, pass: !!v.pass, score: v.score });
+    if (cutoutPng) {
+      const q = await checkCutoutQuality(env, { original: image, cutout: cutoutPng });
+      timing.quality = Date.now() - tQ;
+      if (q && q.available) {
+        qualityCheck = {
+          passed: q.scores.consistency >= QC_THRESHOLD.consistency
+            && q.scores.textReadability >= QC_THRESHOLD.textReadability
+            && q.scores.edgeCleanliness >= QC_THRESHOLD.edgeCleanliness,
+          scores: q.scores,
+          thresholds: QC_THRESHOLD,
+          issues: q.issues || []
+        };
+      } else {
+        // 质检不可用：M2 放行，前端不据此拦截
+        qualityCheck = {
+          passed: true,
+          scores: (q && q.scores) || qualityCheck.scores,
+          thresholds: QC_THRESHOLD,
+          issues: ['qc_unavailable'].concat((q && q.issues) || [])
+        };
+      }
+    } else {
+      timing.quality = Date.now() - tQ;
+      qualityCheck = {
+        passed: false,
+        scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 },
+        thresholds: QC_THRESHOLD,
+        issues: ['cutout_failed_no_product_png']
+      };
     }
   } catch (e) {
-    verify.results.push({ target: 'scene0', error: String((e && e.message) || e) });
+    timing.quality = Date.now() - tQ;
+    qualityCheck = {
+      passed: true,
+      scores: qualityCheck.scores,
+      thresholds: QC_THRESHOLD,
+      issues: ['qc_error', String((e && e.message) || e)]
+    };
   }
 
   // M2 支付/额度预留：非阻塞记录调用次数
@@ -845,21 +909,27 @@ async function handlePipeline(req, env, origin) {
 
   return json({
     ok: true,
-    category: { name: categoryName, confidence: categoryInfo.confidence, source: categoryInfo.source, fields: categoryInfo.fields },
+    category: { name: categoryName, confidence: categoryInfo.confidence, source: categoryInfo.source },
+    productAttributes,
     cutout: {
       strategy: cutoutStrategy,
-      ms: timing.cutout,
+      image: cutoutPng || null,
+      mask: cutoutMask,
       width: cutout ? cutout.width : 0,
       height: cutout ? cutout.height : 0,
-      image: cutoutPng || null,
-      mask: (cutout && cutout.mask) || null
+      ms: timing.cutout
     },
-    images: { white, scene, detail, marketing },
+    backgrounds: {
+      scene,
+      marketing: marketingBg ? [marketingBg] : [null]
+    },
+    compositeGuide,
     detailBoxes,
     copy,
+    qualityCheck,
     timing,
     errors,
-    exportSpecs: EXPORT_SPECS,
+    exportSpecs: EXPORT_SPECS_M2,
     videoReady: false
   }, 200, origin);
 }

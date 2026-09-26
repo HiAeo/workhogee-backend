@@ -459,7 +459,7 @@ const IDENTIFY_SYSTEM_PROMPT = [
   '除了基础信息，你还要从图里找出 3-5 个"能写进商品文案的卖点"——就是买家看了会心动的具体细节，比如材质手感、包装状态、配件、成色、使用场景。',
   '只输出 JSON，不要任何解释。',
   '如果是车辆，返回：{ "kind":"usedcar","brand":"品牌中文，如丰田","series":"车系，如凯美瑞","year":"年款，如2021款","color":"车身颜色，如黑色","energy":"燃油/油电混动/插混增程/纯电","bodyType":"轿车/SUV/MPV/皮卡","condition":"成色描述，如九成新/原版原漆","sellingPoints":["3-5个车况卖点，从图里看出来的，如漆面光亮/内饰干净/轮毂无刮痕"],"defects":["从图里看出来的明显瑕疵，如右前门有刮痕/轮毂有擦伤/前杠有补漆，没有就空数组"],"confidence":0.0到1.0 }',
-  '如果是通用商品，返回：{ "kind":"general","name":"商品名称，如雅诗兰黛小棕瓶精华液100ml","category":"品类，如精华液/运动鞋/蓝牙耳机/T恤/咖啡","brand":"品牌名，如雅诗兰黛","color":"颜色","material":"材质，如玻璃/真皮/棉/铝合金","condition":"成色，如全新未拆/九成新/有使用痕迹","accessories":"配件，如含原盒/含说明书/无配件","scene":"适用场景，如通勤/运动/送礼/居家","sellingPoints":["3-5个从图里看出来的卖点，如玻璃瓶质感好/盒在塑封没拆/滴管设计方便/生产日期标签清晰"],"defects":["从图里看出来的瑕疵或问题，如瓶口有使用痕迹/包装盒有压痕/充电口有磨损，没有就空数组"],"confidence":0.0到1.0 }',
+  '如果是通用商品，返回：{ "kind":"general","name":"商品名称，如雅诗兰黛小棕瓶精华液100ml","category":"品类，如精华液/运动鞋/蓝牙耳机/T恤/咖啡","brand":"品牌名，如雅诗兰黛","color":"颜色","material":"材质，如玻璃/真皮/棉/铝合金","condition":"成色，如全新未拆/九成新/有使用痕迹","accessories":"配件，如含原盒/含说明书/无配件","scene":"适用场景，如通勤/运动/送礼/居家","packagingText":"商品包装/瓶身/标签上清晰可见的文字，照录原文（品牌名、规格、成分表等），看不清就空字符串","sellingPoints":["3-5个从图里看出来的卖点，如玻璃瓶质感好/盒在塑封没拆/滴管设计方便/生产日期标签清晰"],"defects":["从图里看出来的瑕疵或问题，如瓶口有使用痕迹/包装盒有压痕/充电口有磨损，没有就空数组"],"confidence":0.0到1.0 }',
   'sellingPoints 必须是从图片实际看到的细节，不要编。看不清的字段给空字符串，confidence 给你对整体识别的把握程度。'
 ].join('\n');
 
@@ -498,7 +498,7 @@ export async function identifyProduct(env, imageDataUrl) {
   const d = extractJson(contentText);
   if (!d) return { available: false, fields: {} };
   const fields = {};
-  ['kind','brand','series','year','color','energy','bodyType','name','category','material','condition','accessories','scene','confidence'].forEach(k => {
+  ['kind','brand','series','year','color','energy','bodyType','name','category','material','condition','accessories','scene','packagingText','confidence'].forEach(k => {
     if (d[k] !== undefined && d[k] !== null && d[k] !== '') fields[k] = typeof d[k] === 'string' ? d[k].trim() : d[k];
   });
   if (Array.isArray(d.sellingPoints)) fields.sellingPoints = d.sellingPoints.map(String).slice(0, 6);
@@ -1201,4 +1201,150 @@ export async function understandIntent(env, { text = '', context = {} } = {}) {
     product: typeof d.product === 'string' ? d.product.slice(0, 60) : '',
     reply: typeof d.reply === 'string' ? d.reply.slice(0, 120) : ''
   };
+}
+
+/* =====================================================================
+ * M2 pipeline 专用结构化文案（generatePipelineCopy）
+ * ---------------------------------------------------------------------
+ * 输入是 identifyProduct 提取出的真实产品属性，输出严格 JSON：
+ *   { title, sellingPoints[5], description, channels:{taobao,xhs,amazon} }
+ * 与 /copy 的自由文体不同：这里要的是"可直接上架"的结构化字段，
+ * 禁止模板化空话与"请补充..."占位。任何失败降级 {available:false}，
+ * 由 pipeline 兜底为基于已知属性的最小可用文案，绝不阻断。
+ * ===================================================================*/
+const PIPELINE_COPY_BANNED = [
+  '最好','最佳','最优','最低','最高','第一','唯一','首个','首选','顶级','极品','极致','万能',
+  '100%','百分百','纯天然','永久','绝对','彻底','根治','永不','全网最低','史上最','全国第一'
+];
+
+export async function generatePipelineCopy(env, attrs = {}) {
+  const key = env && (env.COPY_API_KEY || env.ARK_API_KEY);
+  if (!env || !key) return { available: false, reason: 'no_key' };
+  const productName = String(attrs.productName || '').trim().slice(0, 60);
+  const category = String(attrs.category || '').trim().slice(0, 30);
+  const material = String(attrs.material || '').trim().slice(0, 40);
+  const color = String(attrs.color || '').trim().slice(0, 20);
+  const packagingText = String(attrs.packagingText || '').trim().slice(0, 200);
+  const sp = Array.isArray(attrs.sellingPoints) ? attrs.sellingPoints.map(String).filter(Boolean).slice(0, 6) : [];
+
+  // 一个属性都没识别出来时，不值得花钱调模型，直接降级
+  if (!productName && !material && !color && sp.length === 0 && !packagingText) {
+    return { available: false, reason: 'no_attributes' };
+  }
+
+  const factsLines = [
+    productName ? '商品名称：' + productName : '',
+    category ? '品类：' + category : '',
+    material ? '材质：' + material : '',
+    color ? '颜色：' + color : '',
+    packagingText ? '包装/瓶身可见文字（照录即可，不要扩写功效）：' + packagingText : '',
+    sp.length ? '从图中识别到的真实卖点（只能基于这些，禁止编造）：' + sp.join('；') : ''
+  ].filter(Boolean).join('\n');
+
+  const sys = [
+    '你是顶级电商商品文案专家。根据给定的【真实商品属性】写一套可直接上架的文案。',
+    '铁律：',
+    '1. 所有内容必须基于给定的真实属性，禁止编造参数、价格、销量、功效、认证、适用人群承诺；',
+    '2. 禁止使用以下广告法违禁词：' + PIPELINE_COPY_BANNED.join('、') + '；',
+    '3. 禁止模板化空话（如"精选好物""品质生活"），禁止"请补充..."占位，禁止留空字段；',
+    '4. 真实属性不足时如实少写，不要硬凑字数、不要瞎编；',
+    '5. sellingPoints 恰好 5 条，每条格式"卖点：具体说明"，说明要落到材质/做工/使用场景上。',
+    '只输出一个 JSON 对象，不要 markdown、不要代码块、不要任何解释。schema：',
+    '{',
+    '  "title": "商品名+核心卖点，15字以内，有吸引力",',
+    '  "sellingPoints": ["卖点：具体说明","...共5条"],',
+    '  "description": "50-80字短描述，包含材质/使用场景/差异化",',
+    '  "channels": {',
+    '    "taobao": "淘宝风格，功能导向，突出实用卖点与参数，80-120字",',
+    '    "xhs": "小红书风格，情感/场景导向，少量emoji+短句，100-150字",',
+    '    "amazon": "Amazon英文风格，规格导向，3-5个bullet point，50-80词"',
+    '  }',
+    '}'
+  ].join('\n');
+  const user = factsLines + '\n\n请按 schema 输出这套商品的完整文案。';
+
+  let resp;
+  try {
+    resp = await fetchWithTimeout(env.COPY_ENDPOINT || VISION_ENDPOINT_DEFAULT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        model: env.COPY_MODEL || COPY_MODEL_DEFAULT,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ],
+        temperature: 0.5,
+        max_tokens: 1300,
+        thinking: { type: 'disabled' }
+      })
+    }, 45000);
+  } catch (e) { return { available: false, reason: 'fetch:' + (e && e.message) }; }
+  const text = await resp.text();
+  if (!resp.ok) return { available: false, reason: 'http_' + resp.status };
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return { available: false, reason: 'bad_json' }; }
+  const ct = parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].message && parsed.choices[0].message.content;
+  if (typeof ct !== 'string' || !ct.trim()) return { available: false, reason: 'empty' };
+  const d = extractJson(ct);
+  if (!d || typeof d !== 'object') return { available: false, reason: 'unparseable' };
+
+  const sellingPoints = Array.isArray(d.sellingPoints)
+    ? d.sellingPoints.map(String).filter(s => s && s.trim()).slice(0, 5)
+    : [];
+  const ch = (d.channels && typeof d.channels === 'object') ? d.channels : {};
+  return {
+    available: true,
+    title: String(d.title || productName || category || '').trim().slice(0, 20),
+    sellingPoints,
+    description: String(d.description || '').trim().slice(0, 120),
+    channels: {
+      taobao: String(ch.taobao || '').trim(),
+      xhs: String(ch.xhs || '').trim(),
+      amazon: String(ch.amazon || '').trim()
+    }
+  };
+}
+
+/* =====================================================================
+ * M2 pipeline 抠图质检（阿果）
+ * ---------------------------------------------------------------------
+ * 后端只做评分、不强制阻断（前端展示分数，不合格提示重生成）。
+ * 三项分数（0~1）：
+ *   consistency      抠图 PNG 与原图产品结构是否一致（无缺块/无变形/无多余物）
+ *   textReadability  包装/瓶身文字在抠图后是否清晰可读（vision OCR 粗判）
+ *   edgeCleanliness  抠图 alpha 边缘是否干净（无白边光晕/无背景残留/无内部空洞）
+ * 阈值：consistency≥0.92, textReadability≥0.9, edgeCleanliness≥0.9。
+ * 注：像素级边缘/相似度精算在前端浏览器做；这里用视觉模型做一次 best-effort
+ * 粗评分，任何失败降级 {available:false}，由 pipeline 标记不阻断。
+ * ===================================================================*/
+export async function checkCutoutQuality(env, { original, cutout } = {}) {
+  const key = env && (env.VISION_API_KEY || env.ARK_API_KEY);
+  if (!env || !key) return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: ['no_vision_key'] };
+  const images = [original, cutout].filter(u => typeof u === 'string' && /^data:image\/(jpe?g|png|webp);base64,/.test(u));
+  if (images.length < 2) {
+    return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: ['no_cutout_image'] };
+  }
+  const sys = '你是电商抠图质检员。第一张是用户原始商品图，第二张是AI抠出的商品透明PNG（请把它想象为贴在白底上观察）。只输出JSON，不要解释。';
+  const user = [
+    '请按以下标准打分（0~1 的小数）：',
+    'consistency：第二张里的商品与第一张是否为同一结构——有无缺块、漏抠、多余物体、变形。完全一致=1.0，明显缺角漏块=0.5以下。',
+    'textReadability：商品包装/瓶身/标签上的文字在第二张里是否依然清晰可读。完全清晰=1.0，糊成一团/被抠掉=0.3以下。图中本就无文字则给1.0。',
+    'edgeCleanliness：第二张商品边缘是否干净——有无白边光晕、背景残留色块、内部空洞。非常干净=1.0，有明显残影=0.5以下。',
+    'issues：发现的具体问题（中文短句），没有就给空数组。',
+    '只输出JSON：{"consistency":0.95,"textReadability":0.9,"edgeCleanliness":0.92,"issues":["..."]}'
+  ].join('\n');
+  const r = await chatVisionCustom(env, { system: sys, user, images, maxTokens: 500, temperature: 0.1, timeoutMs: 30000 });
+  if (!r.ok) {
+    return { available: false, scores: { consistency: 0, textReadability: 0, edgeCleanliness: 0 }, issues: [String(r.error || 'qc_failed')] };
+  }
+  const d = r.data || {};
+  const clamp = n => { n = Number(n); return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0; };
+  const scores = {
+    consistency: clamp(d.consistency),
+    textReadability: clamp(d.textReadability),
+    edgeCleanliness: clamp(d.edgeCleanliness)
+  };
+  const issues = Array.isArray(d.issues) ? d.issues.map(String).slice(0, 8) : [];
+  return { available: true, scores, issues };
 }
