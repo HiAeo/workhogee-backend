@@ -22,6 +22,7 @@ import { matchVehicle } from './kb-data.js';
 import { handleAdmin } from './admin.js';
 import { handleMember } from './member-api.js';
 import { getMemberSession, ensureBootstrapAdmin } from './member-auth.js';
+import { getMemberQuota, checkAndDeductQuota } from './members.js';
 import { handleFeed, ensureFeedBootstrap } from './feed.js';
 import { handleAnalytics, scheduledRollup } from './analytics.js';
 import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision, generatePipelineCopy, checkCutoutQuality } from './vision.js';
@@ -707,6 +708,19 @@ async function handlePipeline(req, env, origin) {
     return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用，请联系客服' } }, 403, origin);
   }
 
+  // M2 额度门禁：totalAvailable = 月度剩余 + 加量包余额（含加量包，修复历史"加量包不生效"bug）
+  const quota = await getMemberQuota(env, session.id);
+  if (!quota || quota.totalAvailable <= 0) {
+    return json({
+      ok: false,
+      error: {
+        code: 'quota_exceeded',
+        message: '本月免费生成额度已用完，可购买加量包或升级套餐继续',
+        upgradeUrl: '/pricing'
+      }
+    }, 402, origin);
+  }
+
   let body;
   try { body = await req.json(); }
   catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
@@ -896,14 +910,21 @@ async function handlePipeline(req, env, origin) {
     };
   }
 
-  // M2 支付/额度预留：非阻塞记录调用次数
+  // M2 额度扣减：pipeline 成功后扣 1 包（先月度、后加量包），并记录使用日志
+  let quotaDeducted = null;
   try {
-    if (env.MEMBERS) {
-      const k = 'pipeline:' + session.id;
-      const n = parseInt(await env.MEMBERS.get(k), 10) || 0;
-      await env.MEMBERS.put(k, String(n + 1));
-    }
-  } catch (e) {}
+    const ded = await checkAndDeductQuota(env, session.id);
+    if (ded.ok) quotaDeducted = { deductedFrom: ded.deductedFrom, remaining: ded.remaining };
+    // 非阻塞使用日志：usage:<memberId>:<ts>，TTL 30 天，便于对账排查
+    try {
+      await env.MEMBERS.put('usage:' + session.id + ':' + Date.now(),
+        JSON.stringify({ at: Date.now(), cost: 1, deductedFrom: ded.deductedFrom || null }),
+        { expirationTtl: 30 * 24 * 3600 });
+    } catch (e2) {}
+  } catch (e) {
+    // 扣减失败不阻断已生成结果（下次 /api/member/me 会暴露），仅记录
+    errors.push({ step: 'quota.deduct', message: String((e && e.message) || e) });
+  }
 
   timing.total = Date.now() - tStart;
 
@@ -930,7 +951,8 @@ async function handlePipeline(req, env, origin) {
     timing,
     errors,
     exportSpecs: EXPORT_SPECS_M2,
-    videoReady: false
+    videoReady: false,
+    quota: quotaDeducted
   }, 200, origin);
 }
 

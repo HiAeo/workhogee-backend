@@ -356,3 +356,138 @@ export function membersToCSV(members) {
   ].map(csvCell).join(','));
   return '\uFEFF' + header.join(',') + '\n' + rows.join('\n');
 }
+
+/* =====================================================================
+ * M2 商业化：月度额度 + 加量包（topup）
+ * ---------------------------------------------------------------------
+ * 计费模型（不做会员+积分双重收费）：
+ *   - free    免费版：每月 3 个物料包（pipeline 调用），次月重置
+ *   - starter 入门版 ¥39/月：每月 50 个物料包，次月重置
+ *   - 加量包 topup：一次性额度，不按月重置，可叠加在任何套餐之上
+ * 可用额度 totalAvailable = monthlyRemaining(月度剩余) + topupBalance(加量包余额)
+ * 扣减顺序：先扣月度额度，月度用完再扣加量包。
+ *
+ * 历史 bug 修复：老逻辑只看月度额度、把加量包漏在可用额度之外，
+ *   导致"买了加量包仍提示订阅额度不足"。这里 totalAvailable 必须
+ *   = monthlyRemaining + topupBalance，检查与扣减都基于它。
+ *
+ * member:<id> 追加字段：
+ *   planExpireAt    套餐到期时间戳
+ *   monthlyQuota    本月月度包数（由 plan 推导，仅展示用）
+ *   monthlyUsed     本月已用包数
+ *   monthlyResetAt  下次跨月重置时间戳（每月 1 号 00:00）
+ *   topupBalance    加量包剩余包数（不按月重置）
+ *   topupHistory    [{orderId, packs, at}]
+ * ===================================================================*/
+export const PLAN_MONTHLY_QUOTA = { free: 3, starter: 50 };
+// 历史 beta / 未识别套餐：M2 商业化起量后统一按免费版计量（3/月），引导付费或加量包
+export const DEFAULT_MONTHLY_QUOTA = 3;
+
+export const TOPUP_PACKS = {
+  t10:  { id: 't10',  packs: 10,  amount: 9.9,  name: '加量包 · 10 包' },
+  t50:  { id: 't50',  packs: 50,  amount: 29.9, name: '加量包 · 50 包' },
+  t200: { id: 't200', packs: 200, amount: 99,   name: '加量包 · 200 包' }
+};
+
+export const PLAN_PRICING = {
+  starter: { id: 'starter', amount: 39, name: '入门版 · 月付', monthlyQuota: 50, periodDays: 30 }
+};
+
+export function planMonthlyQuota(plan) {
+  if (plan === 'starter') return PLAN_MONTHLY_QUOTA.starter;
+  if (plan === 'free') return PLAN_MONTHLY_QUOTA.free;
+  return DEFAULT_MONTHLY_QUOTA; // beta / 历史 / 未知 → 免费版计量
+}
+
+// 下一次「每月 1 号 00:00」时间戳
+function nextMonthStart(ts) {
+  const d = new Date(ts);
+  d.setMonth(d.getMonth() + 1, 1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// 跨月重置：到点则清零 monthlyUsed 并顺延到下个月初；首次访问则初始化。
+// 直接修改传入的 member 对象，必要时落库。
+export async function resetMonthlyIfNeeded(env, member) {
+  if (!member || !env.MEMBERS) return member;
+  const now = Date.now();
+  if (!Number.isFinite(member.monthlyResetAt) || member.monthlyResetAt === null) {
+    // 首次启用额度计量：当月即一个完整计费月，到下个月初重置
+    member.monthlyUsed = 0;
+    member.monthlyResetAt = nextMonthStart(now);
+    await env.MEMBERS.put(KV_PREFIX + member.id, JSON.stringify(member));
+    return member;
+  }
+  if (now >= member.monthlyResetAt) {
+    member.monthlyUsed = 0;
+    member.monthlyResetAt = nextMonthStart(now);
+    await env.MEMBERS.put(KV_PREFIX + member.id, JSON.stringify(member));
+  }
+  return member;
+}
+
+// 读取会员实时额度视图（会顺带做跨月重置）
+export async function getMemberQuota(env, memberId) {
+  const member = await getMember(env, memberId);
+  if (!member) return null;
+  await resetMonthlyIfNeeded(env, member);
+  const monthlyQuota = planMonthlyQuota(member.plan);
+  const monthlyUsed = Math.max(0, Number(member.monthlyUsed) || 0);
+  const monthlyRemaining = Math.max(0, monthlyQuota - monthlyUsed);
+  const topupBalance = Math.max(0, Number(member.topupBalance) || 0);
+  return {
+    plan: member.plan || 'free',
+    monthlyQuota,
+    monthlyUsed,
+    monthlyRemaining,
+    topupBalance,
+    // 历史 bug 修复：可用额度必须叠加加量包
+    totalAvailable: monthlyRemaining + topupBalance,
+    planExpireAt: member.planExpireAt || member.expiresAt || null,
+    monthlyResetAt: member.monthlyResetAt || null
+  };
+}
+
+/**
+ * 检查并扣减一次额度（pipeline 成功后调用）。
+ * 扣减顺序：先月度，后加量包。额度不足返回 { ok:false, code:'quota_exceeded' }。
+ */
+export async function checkAndDeductQuota(env, memberId) {
+  const member = await getMember(env, memberId);
+  if (!member) return { ok: false, code: 'member_not_found', message: '会员不存在' };
+  await resetMonthlyIfNeeded(env, member);
+  const monthlyQuota = planMonthlyQuota(member.plan);
+  let monthlyUsed = Math.max(0, Number(member.monthlyUsed) || 0);
+  let topupBalance = Math.max(0, Number(member.topupBalance) || 0);
+  const monthlyRemaining = Math.max(0, monthlyQuota - monthlyUsed);
+  const totalAvailable = monthlyRemaining + topupBalance; // 含加量包
+  if (totalAvailable <= 0) {
+    return { ok: false, code: 'quota_exceeded', message: '本月生成额度与加量包均已用完' };
+  }
+  let deductedFrom;
+  if (monthlyRemaining > 0) { monthlyUsed++; deductedFrom = 'monthly'; }
+  else { topupBalance--; deductedFrom = 'topup'; }
+  member.monthlyUsed = monthlyUsed;
+  member.topupBalance = topupBalance;
+  member.updatedAt = Date.now();
+  await env.MEMBERS.put(KV_PREFIX + member.id, JSON.stringify(member));
+  return {
+    ok: true,
+    deductedFrom,
+    remaining: Math.max(0, monthlyQuota - monthlyUsed) + topupBalance
+  };
+}
+
+// 加量包到账（支付成功回调调用）
+export async function addTopup(env, memberId, packs, orderId) {
+  const member = await getMember(env, memberId);
+  if (!member) return { ok: false, error: 'member_not_found' };
+  const n = Math.max(0, packs | 0);
+  member.topupBalance = Math.max(0, Number(member.topupBalance) || 0) + n;
+  if (!Array.isArray(member.topupHistory)) member.topupHistory = [];
+  member.topupHistory.push({ orderId: String(orderId || ''), packs: n, at: Date.now() });
+  member.updatedAt = Date.now();
+  await env.MEMBERS.put(KV_PREFIX + member.id, JSON.stringify(member));
+  return { ok: true, topupBalance: member.topupBalance };
+}

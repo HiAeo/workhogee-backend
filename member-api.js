@@ -13,6 +13,8 @@ import {
   registerMember, loginMember, logoutMember, getMemberSession,
   startLoginCode, verifyCodeAuth
 } from './member-auth.js';
+import { getMemberQuota } from './members.js';
+import { createOrder, confirmOrder, listOrders } from './orders.js';
 
 const ALLOWED_ORIGINS = [
   'https://www.workhogee.com', 'http://www.workhogee.com',
@@ -128,6 +130,7 @@ export async function handleMember(request, env, origin) {
   }
 
   if (path === '/api/member/me' && method === 'GET') {
+    const quota = await getMemberQuota(env, session.id);
     return json({
       ok: true,
       member: {
@@ -137,8 +140,43 @@ export async function handleMember(request, env, origin) {
         status: session.status,
         plan: session.plan,
         role: session.role === 'admin' ? 'admin' : 'member'
-      }
+      },
+      quota
     }, 200, origin);
+  }
+
+  // ---- M2：创建订单（套餐 / 加量包） ----
+  if (path === '/api/member/order' && method === 'POST') {
+    const body = await readBody(request) || {};
+    const r = await createOrder(env, session.id, body);
+    if (!r.ok) {
+      const e = r.error || { code: 'order_failed', message: '创建订单失败' };
+      const st = e.code === 'bad_pack' || e.code === 'bad_plan' || e.code === 'bad_type' ? 400 : 500;
+      return json({ ok: false, error: e }, st, origin);
+    }
+    return json(r, 200, origin);
+  }
+
+  // ---- M2：确认支付（内测模拟），支付成功额度到账 ----
+  if (path === '/api/member/order/confirm' && method === 'POST') {
+    const body = await readBody(request) || {};
+    const r = await confirmOrder(env, body.orderId, body.confirmCode);
+    if (!r.ok) {
+      const e = r.error || { code: 'confirm_failed', message: '支付确认失败' };
+      const st = e.code === 'order_not_found' ? 404
+        : e.code === 'already_paid' ? 409
+          : (e.code === 'missing_code' || e.code === 'bad_type') ? 400 : 500;
+      return json({ ok: false, error: e }, st, origin);
+    }
+    // 支付成功后回传最新额度
+    const quota = await getMemberQuota(env, session.id);
+    return json({ ok: true, order: r.order, quota }, 200, origin);
+  }
+
+  // ---- M2：我的订单列表 ----
+  if (path === '/api/member/orders' && method === 'GET') {
+    const orders = await listOrders(env, session.id);
+    return json({ ok: true, orders }, 200, origin);
   }
 
   if (path === '/api/member/logout' && method === 'POST') {
