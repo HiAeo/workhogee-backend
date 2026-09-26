@@ -610,6 +610,260 @@ async function handleSuperRes(req, env, origin) {
   }
   return json({ ok: true, image: r.image, width: r.width, height: r.height, ms: r.ms }, 200, origin);
 }
+
+/* =====================================================================
+ * M1 端到端物料包 pipeline（POST /pipeline）
+ * ---------------------------------------------------------------------
+ * 编排：品类识别 → BiRefNet 抠图(失败降级 RMBG-2.0) → 并行生成 8 图
+ *   (2 白底 + 3 场景 + 2 细节 + 1 营销) + 1 套文案 → 返回全部 dataURL。
+ * 设计纪律：
+ *   - 会员门禁复用 getMemberSession；单图失败不阻断整体（该位置 null，errors 记录）；
+ *   - 生成类调用 Promise.all 并行；白底优先用抠图直出（不额外花一次生成）；
+ *   - Worker 无 Canvas，多规格尺寸变换（淘宝 800 / 小红书 3:4 / Amazon 2000）
+ *     一律在前端 Canvas 完成，后端只给高分辨率原图 + exportSpecs 说明；
+ *   - M2 预留：verifyConsistency 只记录不阻断、调用次数非阻塞计数、videoReady 占位。
+ * ===================================================================*/
+const PIPELINE_GEN_SIZE = DEFAULT_SIZE; // 2048x2048（火山图像像素下限合规）
+const EXPORT_SPECS = [
+  { name: '淘宝主图', size: '800x800', transform: 'resize', note: '前端 Canvas 缩放' },
+  { name: '小红书', size: '1536x2048', ratio: '3:4', transform: 'crop', note: '前端 Canvas 裁切' },
+  { name: 'Amazon主图', size: '2000x2000', transform: 'resize-white', note: '用后端白底图导出，纯白底合规' }
+];
+
+// 品类 → 3 个生活场景提示词（M1 按主流类目预设，未命中走通用场景）
+const CATEGORY_SCENES = {
+  '家居百货': ['北欧风客厅一角，自然光洒落，浅木色家具与绿植点缀', 'ins 风木质桌面，咖啡杯与香薰蜡烛营造温馨氛围', '简约书架旁的生活角落，书籍与收纳盒整齐摆放'],
+  '3C数码': ['科技感极简办公桌，柔和冷色氛围灯，笔记本电脑旁', '纯白色极简背景桌面，干净利落，产品居中', '现代开放式办公场景，明亮落地窗自然光'],
+  '美妆个护': ['ins 风梳妆台，大理石台面，柔和美妆灯光', '浴室大理石台面，白毛巾与尤加利叶点缀', 'ins 风桌面，香水瓶与浅粉花束搭配，柔光'],
+  '服饰鞋包': ['城市街头自然光街拍，浅灰建筑背景', '简约衣架陈列，浅色水泥墙面，自然侧光', '纯色摄影棚背景，简约穿搭站姿展示'],
+  '食品餐饮': ['美食摄影，木质餐桌，窗边自然光，餐具搭配', '现代厨房台面场景，整洁明亮', '暖调木质桌面，暖色食物氛围光']
+};
+function pickScenes(category) {
+  const c = String(category || '');
+  for (const key of Object.keys(CATEGORY_SCENES)) {
+    if (c.includes(key.slice(0, 2)) || c.includes(key)) return CATEGORY_SCENES[key];
+  }
+  return ['明亮简约家居场景，自然光，浅色调', 'ins 风木质桌面，柔和氛围光', '浅色干净背景，柔和侧光，高级商业摄影'];
+}
+
+// callSeedream {b64}/{error} → dataURL；失败抛错，由上层 .catch 兜底为 null
+async function pipelineGen(env, { prompt, imagePayload, size, timeoutMs }) {
+  const r = await callSeedream(env, { prompt, imagePayload, size, timeoutMs });
+  if (r.error) throw new Error((r.error && r.error.code) || 'seedream_failed');
+  const stamped = stampImageMeta(r.b64);
+  const mime = stamped.mime && stamped.mime !== 'image/unknown' ? stamped.mime : 'image/jpeg';
+  return 'data:' + mime + ';base64,' + stamped.b64;
+}
+
+async function handlePipeline(req, env, origin) {
+  // 会员门禁（M2 支付/额度预留：此处记录调用次数）
+  const session = await getMemberSession(env, req);
+  if (!session) {
+    return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号后再生成物料包' } }, 401, origin);
+  }
+  if (session.status === 'suspended') {
+    return json({ ok: false, error: { code: 'member_suspended', message: '账号已停用，请联系客服' } }, 403, origin);
+  }
+
+  let body;
+  try { body = await req.json(); }
+  catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
+
+  const image = body && body.image;
+  if (typeof image !== 'string' || !DATA_URL_RE.test(image)) {
+    return json({ ok: false, error: { code: 'bad_image', message: '缺少合法的商品图 dataURL（jpeg/png/webp）' } }, 400, origin);
+  }
+  if (image.length > MAX_IMAGE_CHARS) {
+    return json({ ok: false, error: { code: 'image_too_large', message: '图片过大，请先压缩到 8MB 以内' } }, 413, origin);
+  }
+  const userCategory = String((body && body.category) || '').slice(0, 50);
+  const style = String((body && body.style) || '').slice(0, 100);
+  const styleLine = style ? ('整体风格：' + style + '。') : '';
+
+  const errors = [];
+  const tStart = Date.now();
+  const timing = { identify: 0, cutout: 0, generate: 0, copy: 0, total: 0 };
+
+  // 1) 品类识别（用户已传 category 则跳过自动识别）
+  let categoryInfo = { name: userCategory || '商品', confidence: 1, source: userCategory ? 'user' : 'auto', fields: {} };
+  if (!userCategory) {
+    const t0 = Date.now();
+    try {
+      const id = await identifyProduct(env, image);
+      timing.identify = Date.now() - t0;
+      if (id && id.available) {
+        const f = id.fields || {};
+        categoryInfo = {
+          name: f.category || f.kind || f.name || '商品',
+          confidence: Number(f.confidence) || 0.8,
+          source: 'auto',
+          fields: f
+        };
+      }
+    } catch (e) {
+      timing.identify = Date.now() - t0;
+      errors.push({ step: 'identify', message: String((e && e.message) || e) });
+    }
+  }
+  const categoryName = categoryInfo.name || '商品';
+  const sellingPoints = Array.isArray(categoryInfo.fields.sellingPoints)
+    ? categoryInfo.fields.sellingPoints.map(String).slice(0, 5) : [];
+
+  // 2) 抠图：autodl(BiRefNet) 优先，失败降级 gitee(RMBG-2.0)
+  const tC = Date.now();
+  let cutout = null;
+  let cutoutStrategy = 'none';
+  let cutoutWhite = null;
+  let cutoutPng = null;
+  const ac = await autodlCutout(env, image);
+  if (ac.ok) {
+    cutout = ac; cutoutStrategy = 'autodl';
+    cutoutWhite = ac.white; cutoutPng = ac.image;
+  } else {
+    errors.push({ step: 'cutout.autodl', message: (ac.error && ac.error.code) || 'autodl_failed' });
+    const gm = await giteeMatting(env, image);
+    if (gm.ok) {
+      cutout = gm; cutoutStrategy = 'gitee';
+      cutoutPng = gm.image; // RMBG 只给透明 PNG，无内置白底（white 由 Seedream 生成）
+    } else {
+      errors.push({ step: 'cutout.gitee', message: (gm.error && gm.error.code) || 'gitee_failed' });
+    }
+  }
+  timing.cutout = Date.now() - tC;
+  const productRef = cutoutPng || image; // 以透明抠图为参考；抠图失败则退回原图
+
+  // 3) 并行生成 8 图（场景3 + 细节2 + 营销1 全部并行；白底按是否有直出白底决定生成数量）
+  const tG = Date.now();
+  const size = PIPELINE_GEN_SIZE;
+  const scenes = pickScenes(categoryName);
+  const genTasks = {};
+
+  // 白底 slot0：autodl 直出白底直接用（不花生成）；gitee 兜底时才生成第一张
+  if (!cutoutWhite) {
+    genTasks.white0 = pipelineGen(env, {
+      prompt: appendGuardClauses('电商纯白底产品主图：参考图中的商品本体保持完全一致，正放在纯白背景（RGB 255,255,255）正中央，产品占画面约 85%，四周留白均匀，无影棚柔和灯光，高分辨率商业摄影。' + styleLine),
+      imagePayload: productRef, size, timeoutMs: 110000
+    }).catch(e => { errors.push({ step: 'white.0', message: String((e && e.message) || e) }); return null; });
+  }
+  // 白底 slot1：第二张不同角度/构图的白底（始终生成，丰富合规主图选择）
+  genTasks.white1 = pipelineGen(env, {
+    prompt: appendGuardClauses('电商纯白底产品主图：参考图中的商品本体保持完全一致，轻微自然透视角度，放置在纯白背景（RGB 255,255,255）中央，产品占画面约 85%，光影柔和立体，高分辨率商业摄影。' + styleLine),
+    imagePayload: productRef, size, timeoutMs: 110000
+  }).catch(e => { errors.push({ step: 'white.1', message: String((e && e.message) || e) }); return null; });
+
+  // 3 张场景图
+  scenes.forEach((sc, i) => {
+    genTasks['scene' + i] = pipelineGen(env, {
+      prompt: appendGuardClauses('电商场景图：参考图中的商品本体保持完全一致（颜色/款式/材质不变），自然摆放在以下生活场景中——' + sc + '。商品自然融合环境光影，真实商业摄影质感，画面高级干净。' + styleLine),
+      imagePayload: productRef, size, timeoutMs: 110000
+    }).catch(e => { errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); return null; });
+  });
+
+  // 细节图：planDetails 取卖点 bbox（M1 记录 bbox 供前端裁剪），再 Seedream 高清重绘特写
+  const detailBoxes = [];
+  try {
+    const pd = await planDetails(env, { image, category: categoryName });
+    if (pd && pd.ok && Array.isArray(pd.details)) pd.details.slice(0, 2).forEach(d => detailBoxes.push(d));
+  } catch (e) {
+    errors.push({ step: 'details-plan', message: String((e && e.message) || e) });
+  }
+  const detailLabels = detailBoxes.length
+    ? detailBoxes.map(d => d.label)
+    : ['核心材质与做工细节', '产品局部质感特写'];
+  detailLabels.forEach((label, i) => {
+    genTasks['detail' + i] = pipelineGen(env, {
+      prompt: appendGuardClauses('电商商品细节特写摄影：聚焦参考商品的「' + label + '」部位，高清放大展示材质纹理、做工工艺与局部设计，保持商品本体一致，干净浅色背景，柔和侧光突出质感。' + styleLine),
+      imagePayload: productRef, size, timeoutMs: 110000
+    }).catch(e => { errors.push({ step: 'detail.' + i, message: String((e && e.message) || e) }); return null; });
+  });
+
+  // 1 张营销图（带卖点文字排版）
+  genTasks.marketing = pipelineGen(env, {
+    prompt: appendGuardClauses('电商营销主图：突出参考图中的商品本体，画面简洁高级、排版干净留白适当，加入简洁的卖点文字排版（中文，清晰不乱码，不要多余文字），商业广告质感，光线明亮。' + styleLine),
+    imagePayload: productRef, size, timeoutMs: 110000
+  }).catch(e => { errors.push({ step: 'marketing', message: String((e && e.message) || e) }); return null; });
+
+  const settled = await Promise.all(Object.values(genTasks));
+  timing.generate = Date.now() - tG;
+  const out = {};
+  Object.keys(genTasks).forEach((k, i) => { out[k] = settled[i]; });
+
+  // 4) 文案生成
+  const tCp = Date.now();
+  let copy = { title: categoryName, sellingPoints, description: '' };
+  try {
+    const c = await generateCopy(env, {
+      product: (categoryInfo.fields && categoryInfo.fields.name) || categoryName,
+      category: categoryName,
+      sellingPoints,
+      channels: ['general']
+    });
+    timing.copy = Date.now() - tCp;
+    if (c && c.available && c.channels) {
+      copy = {
+        title: c.channels.title || categoryName,
+        sellingPoints: sellingPoints.length ? sellingPoints : [categoryName + ' 精选好物'],
+        description: c.channels.general || ''
+      };
+    }
+  } catch (e) {
+    timing.copy = Date.now() - tCp;
+    errors.push({ step: 'copy', message: String((e && e.message) || e) });
+  }
+
+  // 组装 images：white 始终 2 张（直出白底优先，不足用生成白底补）
+  const white = [
+    cutoutWhite || out.white0 || out.white1 || null,
+    out.white1 || out.white0 || cutoutWhite || null
+  ];
+  const scene = [out.scene0 || null, out.scene1 || null, out.scene2 || null];
+  const detail = [out.detail0 || null, out.detail1 || null];
+  const marketing = out.marketing ? [out.marketing] : [null];
+
+  // M2 质检门禁预留：记录 verify 结果但不阻断（只对首张场景图做一次最佳努力后验）
+  const verify = { enabled: true, blocking: false, results: [] };
+  try {
+    const target = scene[0] || marketing[0];
+    if (target) {
+      const v = await verifyConsistency(env, { originals: [image], result: target }, 20000);
+      verify.results.push({ target: 'scene0', available: !!v.available, pass: !!v.pass, score: v.score });
+    }
+  } catch (e) {
+    verify.results.push({ target: 'scene0', error: String((e && e.message) || e) });
+  }
+
+  // M2 支付/额度预留：非阻塞记录调用次数
+  try {
+    if (env.MEMBERS) {
+      const k = 'pipeline:' + session.id;
+      const n = parseInt(await env.MEMBERS.get(k), 10) || 0;
+      await env.MEMBERS.put(k, String(n + 1));
+    }
+  } catch (e) {}
+
+  timing.total = Date.now() - tStart;
+
+  return json({
+    ok: true,
+    category: { name: categoryName, confidence: categoryInfo.confidence, source: categoryInfo.source, fields: categoryInfo.fields },
+    cutout: {
+      strategy: cutoutStrategy,
+      ms: timing.cutout,
+      width: cutout ? cutout.width : 0,
+      height: cutout ? cutout.height : 0,
+      image: cutoutPng || null,
+      mask: (cutout && cutout.mask) || null
+    },
+    images: { white, scene, detail, marketing },
+    detailBoxes,
+    copy,
+    timing,
+    errors,
+    exportSpecs: EXPORT_SPECS,
+    videoReady: false
+  }, 200, origin);
+}
+
 async function handlePrivacyDetect(req, env, origin) {
   const session = await getMemberSession(env, req);
   if (!session) {
@@ -964,6 +1218,11 @@ export default {
     }
     if (path === '/verify' && request.method === 'POST') {
       return handleVerify(request, env, origin);
+    }
+
+    // M1 端到端物料包 pipeline：品类识别→抠图→8图+文案一键生成（会员门禁）
+    if (path === '/pipeline' && request.method === 'POST') {
+      return handlePipeline(request, env, origin);
     }
 
     // 上传实拍图智能质检（vision 判定遮挡/完整度/构图）
