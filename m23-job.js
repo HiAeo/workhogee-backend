@@ -14,7 +14,9 @@
  * ===================================================================*/
 
 import { presignPut, presignGet, tosPut, tosGetUrl, tosHead } from './tos.js';
-import { identifyProduct, generatePipelineCopy, checkCutoutQuality } from './vision.js';
+import { generatePipelineCopy, checkCutoutQuality } from './vision.js';
+import { generateProductScript, normalizeScript } from './script-engine.js';
+import { saveCase } from './casebook.js';
 import { picwishCutoutByUrl } from './picwish.js';
 
 const DEFAULT_SIZE = '2048x2048';
@@ -179,7 +181,7 @@ async function refreshOutputUrls(env, job) {
   }
 }
 
-const STEP_ORDER = ['identify', 'cutout', 'scene', 'marketing', 'copy', 'qc'];
+const STEP_ORDER = ['script', 'cutout', 'scene', 'marketing', 'copy', 'qc'];
 
 function emptySteps() {
   return STEP_ORDER.map(n => ({ name: n, status: 'pending', ms: 0 }));
@@ -227,14 +229,19 @@ export async function createUploadUrl(env, session) {
 }
 
 /** 创建 job（不跑后台任务；由 GET /job 轮询逐步驱动）。 */
-export async function createAndRunJob(env, session, { key, category, style, quotaResult }) {
+export async function createAndRunJob(env, session, { key, category, style, kitType, script, platform, quotaResult }) {
   const jobId = 'job_' + session.id + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const kt = (kitType === 'fashion') ? 'fashion' : 'ecommerce';
   const job = {
     jobId,
     memberId: session.id,
     key,
     category: category || '',
     style: style || '',
+    kitType: kt,
+    platform: platform || '',
+    // 用户在 /generate-script 确认后回传的脚本；为空则 script 步内部自动生成
+    userScript: script && typeof script === 'object' ? script : null,
     status: 'running',
     progress: 0,
     steps: emptySteps(),
@@ -257,24 +264,45 @@ export async function createAndRunJob(env, session, { key, category, style, quot
 
 /* ===== 各 step 的具体实现（每个只持有必要资源，结束即释放）===== */
 
-async function stepIdentify(env, job) {
-  const cfg = tosConfig(env);
-  const originalUrl = await tosGetUrl(cfg, job.key, 3600);
-  const id = await identifyProduct(env, originalUrl);
-  let fields = {};
-  let categoryName = job.category || '商品';
-  if (id && id.available && id.fields) {
-    fields = id.fields;
-    if (!job.category) categoryName = fields.category || fields.kind || fields.name || '商品';
+/**
+ * M3 脚本步：要么用前端确认过的 userScript，要么现场调视觉模型生成出图脚本。
+ * 脚本是整个 pipeline 的指挥棒：场景背景取自 useScenes，细节裁剪提示取自 keyParts，
+ * 文案取自 sellingPoints。任何失败都降级为最小可用骨架，绝不阻断出图。
+ */
+async function stepScript(env, job) {
+  const kitType = job.kitType || 'ecommerce';
+  let script = null;
+  if (job.userScript && typeof job.userScript === 'object' && job.userScript.productName) {
+    script = normalizeScript(job.userScript, kitType);
+    job.results.scriptSource = 'user_confirmed';
+  } else {
+    const cfg = tosConfig(env);
+    const originalUrl = await tosGetUrl(cfg, job.key, 3600);
+    const r = await generateProductScript(env, { imageUrl: originalUrl, kitType });
+    if (r.ok) {
+      script = r.script;
+      job.results.scriptSource = 'vision_auto';
+    } else {
+      // 视觉脚本生成失败：降级骨架（场景走通用背景，卖点走兜底文案）
+      script = normalizeScript({ category: job.category || '商品' }, kitType);
+      job.results.scriptSource = 'fallback';
+      job.errors.push({ step: 'script', message: String(r.error || 'script_failed') });
+    }
   }
+  job.results.script = script;
+  // 细节卖点图：keyParts 作为裁剪提示传给前端（前端按提示在原图上裁剪，零重绘）
+  job.results.detailBoxes = (script.keyParts || []).map(p => ({ partName: String(p).slice(0, 20), bboxHint: String(p) }));
+  // 兼容老字段（copy 步用）
   job.results.productAttributes = {
-    productName: String(fields.name || ''),
-    material: String(fields.material || ''),
-    color: String(fields.color || ''),
-    sellingPoints: Array.isArray(fields.sellingPoints) ? fields.sellingPoints.map(String).slice(0, 5) : [],
-    packagingText: String(fields.packagingText || '')
+    productName: script.productName,
+    material: '',
+    color: '',
+    sellingPoints: script.sellingPoints || [],
+    packagingText: ''
   };
-  job.results.category = { name: categoryName, source: job.category ? 'user' : 'vision' };
+  job.results.category = { name: script.category || '商品', source: job.results.scriptSource };
+  // 案例沉淀（best-effort，不阻塞主流程；KV 写失败内部已吞掉）
+  saveCase(env, script);
 }
 
 async function stepCutout(env, job) {
@@ -293,9 +321,16 @@ async function stepCutout(env, job) {
   job.results.cutoutHeight = pw.height;
 }
 
+/**
+ * M3 场景步：背景 prompt 不再硬编码品类库，而是取自脚本 useScenes（这一件商品的真实使用场景）。
+ * 3 个场景槽位按 useScenes 轮询填充；脚本缺失时降级到品类预设/通用预设。
+ * fashion 套版：模特图×2 本期用场景图占位（前端按 recommendedShots 的 placeholder 标注"AI模特即将上线"）。
+ */
 async function stepScene(env, job) {
-  const categoryName = (job.results.category && job.results.category.name) || '商品';
-  const presets = pickBackgrounds(categoryName);
+  const script = job.results.script || {};
+  const scenes = Array.isArray(script.useScenes) && script.useScenes.length ? script.useScenes : [];
+  const fallbackPresets = pickBackgrounds((job.results.category && job.results.category.name) || '商品');
+  const sceneDescs = [0, 1, 2].map(i => scenes[i] || (fallbackPresets[i] && fallbackPresets[i].bg) || GENERIC_BG_PRESETS[i].bg);
   const styleLine = job.style || '';
   // sceneSeedUrls = Seedream 原始 URL（生成状态 + 降级兜底）；sceneKeys = 自有 TOS key
   const seedUrls = job.results.sceneSeedUrls || [null, null, null];
@@ -306,13 +341,13 @@ async function stepScene(env, job) {
   if (!seedUrls[0]) todo.push(0);
   if (!seedUrls[1]) todo.push(1);
   await Promise.all(todo.map(i =>
-    seedreamTextGenUrl(env, { prompt: sceneBgPrompt(presets[i].bg, styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 })
+    seedreamTextGenUrl(env, { prompt: sceneBgPrompt(sceneDescs[i], styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 })
       .then(u => { seedUrls[i] = u; })
       .catch(e => { job.errors.push({ step: 'scene.' + i, message: String((e && e.message) || e) }); })
   ));
   // 第二批：第三张（留给下一次轮询）
   if (!seedUrls[2]) {
-    try { seedUrls[2] = await seedreamTextGenUrl(env, { prompt: sceneBgPrompt(presets[2].bg, styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 }); }
+    try { seedUrls[2] = await seedreamTextGenUrl(env, { prompt: sceneBgPrompt(sceneDescs[2], styleLine), size: DEFAULT_SIZE, timeoutMs: 95000 }); }
     catch (e) { job.errors.push({ step: 'scene.2', message: String((e && e.message) || e) }); }
   }
   // 逐张转存到自有 TOS（下载→转存→释放，单张内存；失败降级保留 Seedream URL）
@@ -323,7 +358,11 @@ async function stepScene(env, job) {
   }
   job.results.sceneSeedUrls = seedUrls;
   job.results.sceneKeys = sceneKeys;
-  job.results.compositeGuide = { scene: presets.map(p => p.guide), marketing: { position: 'center', scale: 0.5, shadow: true } };
+  job.results.sceneDescs = sceneDescs;
+  job.results.compositeGuide = {
+    scene: [0, 1, 2].map(() => ({ position: 'center', scale: 0.55, shadow: true, colorTemp: 'natural' })),
+    marketing: { position: 'center', scale: 0.5, shadow: true }
+  };
   // 全部三张拿到才算 done
   if (!seedUrls[0] || !seedUrls[1] || !seedUrls[2]) throw new Error('scene_partial_retry');
 }
@@ -382,7 +421,7 @@ async function stepQc(env, job) {
 }
 
 const STEP_FN = {
-  identify: stepIdentify,
+  script: stepScript,
   cutout: stepCutout,
   scene: stepScene,
   marketing: stepMarketing,

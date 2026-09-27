@@ -457,13 +457,12 @@ export async function qcUpload(env, imageDataUrl) {
  * ===================================================================*/
 
 const IDENTIFY_SYSTEM_PROMPT = [
-  '你是电商商品识别引擎。用户上传了一张商品实拍图（可能是二手车，也可能是通用商品如化妆品、服装、3C、食品、家居等）。',
+  '你是电商商品识别引擎，适用于一切实物商品（美妆、服饰、3C数码、食品、家居、运动户外、二手车辆等，车辆也按普通商品处理）。',
   '请仔细看图，把你能从图片中可靠识别出的信息全部提取出来。看不清或不确定的字段不要猜，留空。',
   '除了基础信息，你还要从图里找出 3-5 个"能写进商品文案的卖点"——就是买家看了会心动的具体细节，比如材质手感、包装状态、配件、成色、使用场景。',
-  '只输出 JSON，不要任何解释。',
-  '如果是车辆，返回：{ "kind":"usedcar","brand":"品牌中文，如丰田","series":"车系，如凯美瑞","year":"年款，如2021款","color":"车身颜色，如黑色","energy":"燃油/油电混动/插混增程/纯电","bodyType":"轿车/SUV/MPV/皮卡","condition":"成色描述，如九成新/原版原漆","sellingPoints":["3-5个车况卖点，从图里看出来的，如漆面光亮/内饰干净/轮毂无刮痕"],"defects":["从图里看出来的明显瑕疵，如右前门有刮痕/轮毂有擦伤/前杠有补漆，没有就空数组"],"confidence":0.0到1.0 }',
-  '如果是通用商品，返回：{ "kind":"general","name":"商品名称，如雅诗兰黛小棕瓶精华液100ml","category":"品类，如精华液/运动鞋/蓝牙耳机/T恤/咖啡","brand":"品牌名，如雅诗兰黛","color":"颜色","material":"材质，如玻璃/真皮/棉/铝合金","condition":"成色，如全新未拆/九成新/有使用痕迹","accessories":"配件，如含原盒/含说明书/无配件","scene":"适用场景，如通勤/运动/送礼/居家","packagingText":"商品包装/瓶身/标签上清晰可见的文字，照录原文（品牌名、规格、成分表等），看不清就空字符串","sellingPoints":["3-5个从图里看出来的卖点，如玻璃瓶质感好/盒在塑封没拆/滴管设计方便/生产日期标签清晰"],"defects":["从图里看出来的瑕疵或问题，如瓶口有使用痕迹/包装盒有压痕/充电口有磨损，没有就空数组"],"confidence":0.0到1.0 }',
-  'sellingPoints 必须是从图片实际看到的细节，不要编。看不清的字段给空字符串，confidence 给你对整体识别的把握程度。'
+  '只输出 JSON，不要任何解释。统一字段 schema（二手车也用这套，不要输出 brand/series/year/energy/bodyType 等车辆专用字段，把车况信息揉进 sellingPoints）：',
+  '{ "productName":"商品名称，含颜色/规格/材质，如黑色2021款丰田凯美瑞轿车/雅诗兰黛小棕瓶精华100ml","category":"子品类，要具体，如山地车/口红/头戴式耳机/纯棉T恤/每日坚果/二手轿车","brand":"品牌名，看不清就留空","color":"颜色","material":"材质，如玻璃/真皮/棉/铝合金/金属漆面","condition":"成色，如全新未拆/九成新/原版原漆/有使用痕迹","packagingText":"商品包装/标签上清晰可见的文字，照录原文，看不清就空字符串","sellingPoints":["3-5个从图里看出来的卖点，如漆面光亮内饰干净/玻璃瓶质感好/塑封没拆/滴管设计方便"],"defects":["从图里看出来的瑕疵或问题，如右前门有刮痕/瓶口有使用痕迹，没有就空数组"],"keyParts":["2-4个最值得放大拍细节的部位，如避震前叉/磁吸管身/领口双车线"],"useScenes":["2-3个使用场景，如通勤/运动/送礼/居家/周末郊野"],"targetAudience":"适用人群，如通勤上班族/户外爱好者/送礼人群","confidence":0.0到1.0 }',
+  'sellingPoints、keyParts、useScenes 必须是从图片实际看到的内容，不要编。看不清的字段给空字符串，confidence 给你对整体识别的把握程度。'
 ].join('\n');
 
 export async function identifyProduct(env, imageDataUrl) {
@@ -501,11 +500,15 @@ export async function identifyProduct(env, imageDataUrl) {
   const d = extractJson(contentText);
   if (!d) return { available: false, fields: {} };
   const fields = {};
-  ['kind','brand','series','year','color','energy','bodyType','name','category','material','condition','accessories','scene','packagingText','confidence'].forEach(k => {
+  // M3：统一商品识别 schema。name 为 productName 的兼容别名（老调用方读 fields.name）。
+  ['productName','name','brand','category','color','material','condition','packagingText','targetAudience','confidence'].forEach(k => {
     if (d[k] !== undefined && d[k] !== null && d[k] !== '') fields[k] = typeof d[k] === 'string' ? d[k].trim() : d[k];
   });
+  if (!fields.name && fields.productName) fields.name = fields.productName;
   if (Array.isArray(d.sellingPoints)) fields.sellingPoints = d.sellingPoints.map(String).slice(0, 6);
   if (Array.isArray(d.defects)) fields.defects = d.defects.map(String).slice(0, 6);
+  if (Array.isArray(d.keyParts)) fields.keyParts = d.keyParts.map(String).slice(0, 4);
+  if (Array.isArray(d.useScenes)) fields.useScenes = d.useScenes.map(String).slice(0, 3);
   return { available: true, fields };
 }
 
@@ -711,7 +714,7 @@ const FACT_SCHEMAS = {
 };
 
 function factSchemaFor(identityType, category) {
-  if (identityType === 'usedcar') return FACT_SCHEMAS.usedcar;
+  // M3：二手车走通用商品 schema（不再有 usedcar 专用事实表）
   const cat = String(category || '');
   if (/鲜花|花束|花卉|花店|flower/i.test(cat)) return FACT_SCHEMAS.flower;
   return FACT_SCHEMAS.general;
@@ -791,7 +794,7 @@ export async function prefillFacts(env, { image = '', identityType = 'general', 
     }
     if (v != null && String(v).trim()) out[k] = String(v).trim();
   });
-  const schemaId = schema === FACT_SCHEMAS.usedcar ? 'usedcar' : (schema === FACT_SCHEMAS.flower ? 'flower' : 'general');
+  const schemaId = schema === FACT_SCHEMAS.flower ? 'flower' : 'general';
   return { ok: true, schema: schemaId, fields: out };
 }
 

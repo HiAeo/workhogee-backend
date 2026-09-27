@@ -1,4 +1,4 @@
-﻿/* =====================================================================
+/* =====================================================================
  * WorkHogee 生图伙计 · Cloudflare Worker 薄代理层
  * ---------------------------------------------------------------------
  * 职责（刻意保持“薄”）：
@@ -27,13 +27,14 @@ import { handleFeed, ensureFeedBootstrap } from './feed.js';
 import { handleAnalytics, scheduledRollup } from './analytics.js';
 import { verifyConsistency, appendGuardClauses, qcUpload, generateCopy, generateStoryboard, identifyProduct, groupProducts, extractProductFeatures, understandIntent, prefillFacts, planDetails, chatVisionCustom, detectPlatesByVision, generatePipelineCopy, checkCutoutQuality } from './vision.js';
 import { stampImageMeta } from './image-meta.js';
-import { presignPut, presignGet } from './tos.js';
+import { presignPut, presignGet, tosGetUrl } from './tos.js';
 import { segmentEntities, superResolve, saliencySegment, goodsSegment, carPlateDetection } from './cv.js';
 import { mediakitCutout, mediakitFaceDetect } from './mediakit.js';
 import { giteeMatting } from './gitee.js';
 import { autodlCutout, autodlSuperRes } from './autodl.js';
 import { picwishCutout } from './picwish.js';
 import { createUploadUrl, createAndRunJob, getJob, tryAcquireSlot, releaseSlot, headObject, keyBelongsTo } from './m23-job.js';
+import { generateProductScript } from './script-engine.js';
 
 const ARK_ENDPOINT_DEFAULT = 'https://ark.cn-beijing.volces.com/api/v3/images/generations';
 // 火山图像接口要求输出像素 ≥ 3,686,400。
@@ -1121,6 +1122,11 @@ async function handlePipelineAsync(req, env, origin, ctx, body) {
   const key = String((body && body.key) || '');
   const category = String((body && body.category) || '').slice(0, 50);
   const style = String((body && body.style) || '').slice(0, 100);
+  // M3：套版类型 ecommerce(默认静物) | fashion(服装/穿戴，模特图占位)；
+  // script 为前端在 /generate-script 确认/编辑后的出图脚本，不传则 job 内自动生成。
+  const kitType = (body && body.kitType === 'fashion') ? 'fashion' : 'ecommerce';
+  const script = (body && body.script && typeof body.script === 'object') ? body.script : null;
+  const platform = String((body && body.platform) || '').slice(0, 30);
 
   // 1) key 归属校验（无网络）
   if (!keyBelongsTo(session, key)) {
@@ -1149,7 +1155,7 @@ async function handlePipelineAsync(req, env, origin, ctx, body) {
   }
   // 5) 创建并后台执行（失败时内部会释放槽位）
   try {
-    const r = await createAndRunJob(env, session, { key, category, style, quotaResult });
+    const r = await createAndRunJob(env, session, { key, category, style, kitType, script, platform, quotaResult });
     return json({ ok: true, jobId: r.jobId, status: r.status }, 202, origin);
   } catch (e) {
     await releaseSlot(env, session.id);
@@ -1175,6 +1181,37 @@ async function handleJobStatus(req, env, origin, url) {
   const r = await getJob(env, session, jobId);
   if (!r.ok) return json({ ok: false, error: { code: r.error.code, message: r.error.message } }, r.status, origin);
   return json({ ok: true, ...r.job }, 200, origin);
+}
+
+// M3 实例级出图脚本：对"这一件商品"现场识别商品名/卖点/人群/场景/部件，
+// 返回结构化脚本给前端确认/编辑；不传任何品类信息，全靠视觉模型看图写。
+async function handleGenerateScript(req, env, origin) {
+  const session = await getMemberSession(env, req);
+  if (!session) return json({ ok: false, error: { code: 'member_unauthorized', message: '请先登录会员账号' } }, 401, origin);
+  let body;
+  try { body = await req.json(); }
+  catch { return json({ ok: false, error: { code: 'bad_json', message: '请求体不是合法 JSON' } }, 400, origin); }
+  const key = String((body && body.key) || '');
+  const kitType = (body && body.kitType === 'fashion') ? 'fashion' : 'ecommerce';
+  if (!keyBelongsTo(session, key)) {
+    return json({ ok: false, error: { code: 'forbidden_key', message: 'key 不合法或不属于当前会员' } }, 400, origin);
+  }
+  if (!(await headObject(env, key))) {
+    return json({ ok: false, error: { code: 'object_not_found', message: '上传对象不存在，请先调 /upload-url 并 PUT 上传' } }, 400, origin);
+  }
+  // 预签名公网 URL 给视觉模型看图
+  const region = env.TOS_REGION || 'cn-beijing';
+  const cfg = {
+    accessKeyId: env.TOS_ACCESS_KEY_ID, secretAccessKey: env.TOS_SECRET_ACCESS_KEY,
+    bucket: env.TOS_BUCKET, region,
+    endpoint: env.TOS_ENDPOINT || ('tos-' + region + '.volces.com')
+  };
+  let imageUrl;
+  try { imageUrl = await tosGetUrl(cfg, key, 3600); }
+  catch { return json({ ok: false, error: { code: 'tos_presign_failed', message: '存储预签名失败' } }, 500, origin); }
+  const r = await generateProductScript(env, { imageUrl, kitType });
+  if (!r.ok) return json({ ok: false, error: { code: 'script_failed', message: String(r.error || '视觉识别失败，请重试') } }, 502, origin);
+  return json({ ok: true, script: r.script }, 200, origin);
 }
 
 async function handlePrivacyDetect(req, env, origin) {
@@ -1541,6 +1578,10 @@ export default {
     // M2.3 异步 job 状态轮询（只返回 JSON + URL，不返回图片数据）
     if (path === '/job' && request.method === 'GET') {
       return handleJobStatus(request, env, origin, url);
+    }
+    // M3 实例级出图脚本（AI 看图自动写商品名/卖点/场景/部件，前端确认后再出图）
+    if (path === '/generate-script' && request.method === 'POST') {
+      return handleGenerateScript(request, env, origin);
     }
 
     // M2.3 物料包 pipeline（分发：带 key 走异步 job；带 base64 走旧同步兼容，已 deprecated）
